@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=HDA Audio Router
+Comment=Universal HDA PipeWire Audio Splitter & Per-Tab Router
+Exec=hda-audio-control --tray
+Icon=hda-pipewire-split
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Settings;
+StartupNotify=true
