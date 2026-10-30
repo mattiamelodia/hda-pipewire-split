@@ -1,167 +1,166 @@
-# Universal HDA PipeWire Audio Splitter & Per-Tab Router (v1.0)
+# HDA PipeWire Splitter & Per-Application Router
 
-A standalone, zero-daemon Linux audio router and hardware splitter designed for laptops with **Realtek HDA** codecs (`ALC285`, `ALC287`, `ALC295`, `ALC897`, `ALC256`, etc.). It unlocks simultaneous, independent playback across **3.5mm Headphones** and **Internal Speakers** with granular per-tab and per-application routing.
+A Linux tool for laptops with a **Realtek HDA** codec. It splits the card's 4-channel `pro-audio` PipeWire node into three virtual sinks, **Headphones**, **Speakers** and **Both**, so the 3.5mm jack and the internal speakers can play at the same time, and a small PyQt6 app routes each application's audio to one of them.
+
+It only works if your codec/PCM exposes four independent output channels in `pro-audio` (see [Hardware compatibility](#hardware-compatibility)).
 
 ---
 
 ## The Problem
 
-On modern Linux laptops (ASUS ROG/Zephyrus, Lenovo ThinkPad/Yoga, Dell XPS, HP Spectre) with shared HDA audio codecs:
-1. **Mutually Exclusive Outputs**: Plugging in 3.5mm headphones triggers hardware/ALSA `Auto-Mute`, cutting off the internal speakers.
-2. **Single Shared PipeWire Sink**: PipeWire/WirePlumber exposes a single combined output node, preventing independent playback unless switched to raw `pro-audio` profiles (`AUX0`–`AUX3`).
-3. **No Per-Tab Granularity**: Standard mixers cannot easily distinguish or pin individual browser tabs (e.g., keeping Discord or a lecture on headphones while playing YouTube or music on the laptop speakers).
+On many laptops with a shared HDA codec:
+
+1. **Mutually exclusive outputs**: plugging in headphones triggers ALSA `Auto-Mute`, which silences the internal speakers.
+2. **One combined sink**: PipeWire/WirePlumber exposes a single analog output, so you cannot play different streams on the jack and the speakers. The raw `pro-audio` profile exposes the channels separately (`AUX0`-`AUX3`), but not as usable sinks.
+3. **No per-application routing** in common mixers for this use case (e.g. a call on the headphones while music plays on the speakers).
 
 ---
 
-## Architecture & How It Works
+## How It Works
 
-The application runs locally with zero background overhead, bridging ALSA hardware events directly to PipeWire's native loopback and combine modules.
+Two independent parts:
+
+* **The sinks** are a native PipeWire drop-in, `~/.config/pipewire/pipewire.conf.d/99-hda-split.conf` (two `libpipewire-module-loopback` instances plus one `libpipewire-module-combine-stream`). PipeWire loads it by itself, so the sinks keep existing and working **without the app running**.
+* **The app** (`hda-audio-control`) is a normal GUI/tray process. It calls `pactl`, `pw-link` and `amixer`, listens to `pactl subscribe` and `alsactl monitor` for stream and jack events, and moves streams between the sinks.
 
 ```text
- [ Physical 3.5mm Jack ] 
-        │ (Hotplug / alsactl monitor)
-        ▼
-┌────────────────────────────────────────────────────────┐
-│                   AudioEngine (Python)                 │
-│  - Jack State Detection                                │
-│  - ALSA Auto-Mute Control                              │
-│  - Stream & Sink Routing                               │
-└───┬────────────────────────────────┬───────────────────┘
-    │                                │
-    ▼                                ▼
-[ Native Pipewire Sinks ]    [ Per-App Pinned Rules ]
- ├── Headphones (AUX0/1)      └── pinned_apps.json
+ [ 3.5mm jack ]
+       │ alsactl monitor
+       ▼
+┌────────────────────────────────────────────┐
+│          hda-audio-control (Python)        │
+│  - jack state, Auto-Mute handling          │
+│  - stream discovery (pactl subscribe)      │
+│  - per-stream routing and pins             │
+└───────┬──────────────────────────┬─────────┘
+        │ pactl move-sink-input    │
+        ▼                          ▼
+[ PipeWire drop-in sinks ]   [ pinned_apps.json ]
+ ├── Headphones (AUX0/1)
  ├── Speakers   (AUX2/3)
- └── Both       (Combine)
- ```
-
----
-
-## Key Features in v1.0
-
-* **100% Native PipeWire Drop-In (Zero Subprocesses)**: Generates `~/.config/pipewire/pipewire.conf.d/99-hda-split.conf` using `libpipewire-module-loopback` and `libpipewire-module-combine-stream`. Virtual `Headphones`, `Speakers`, and an isolated `Both` sink are loaded natively by the PipeWire daemon at boot without external background processes.
-* **Event-Driven Jack Detection (0% CPU, 0ms Latency)**: Uses a non-blocking `alsactl monitor` thread with auto-recovery on suspend/resume. The app sleeps at 0% CPU and reacts instantaneously when the physical 3.5mm jack is plugged or unplugged.
-* **Persistent App Pinning (`pinned_apps.json`)**: Streams or applications manually pinned are remembered across application restarts and jack disconnect events.
-* **Master Volume Sliders & USB/Bluetooth Detection**: Quick control panels for master output volumes and dynamic detection of external USB DACs or Bluetooth headphones.
-* **Universal HDA Auto-Discovery Wizard**: Automatically scans `/proc/asound` and `/sys/class/sound`, filters out GPU HDMI controllers, selects the analog HDA codec, and calibrates physical `AUX` channels using an in-memory soft sine wave impulse.
-* **System Tray Integration & CLI Keybindings**: Minimizes cleanly to the system tray with live jack status and provides instant CLI flags (`--force-hp`, `--force-spk`, `--force-both`, `--toggle-mute`) for window manager keybindings (Hyprland, Sway, i3).
-
----
-
-## Architecture & Directory Structure
-
-```text
-hda-pipewire-split/
-├── hda_split/
-│   ├── __init__.py                  # Package metadata
-│   ├── config.py                    # HDA auto-discovery & native drop-in generator
-│   ├── engine.py                    # ALSA unmuting, master volumes & stream routing
-│   ├── monitor.py                   # Event-driven QThread with auto-recovery
-│   ├── mpris.py                     # D-Bus / playerctl browser tab title resolver
-│   └── gui.py                       # PyQt6 modern dark mixer, Master bars & System Tray
-├── main.py                          # Unified CLI entry point (--tray, --wizard, --force-*)
-├── wizard.py                        # Interactive soft-tone AUX channel calibration
-├── hda-audio-control.desktop        # Desktop launcher entry
-├── install.sh                       # Automated modular installer
-├── uninstall.sh                     # Clean uninstaller (removes drop-in & configs)
-├── PKGBUILD                         # Arch Linux / AUR package build script
-├── tests/                           # Unit test suite
-└── README.md                        # Documentation
+ └── Both       (combine-stream)
 ```
+
+---
+
+## Features
+
+* **Wizard**: scans `/proc/asound`, picks the analog HDA codec (ignoring GPU HDMI), switches it to `pro-audio`, checks that `AUX0`-`AUX3` all exist, then plays a soft test tone on each pair and asks which output you heard. It saves the mapping only if the answers are consistent.
+* **Per-stream routing**: each PipeWire playback stream gets its own row. Clicking *Headphones*, *Speakers* or *Both* moves that stream immediately; it does **not** pin it.
+* **Pins (📌)**: pinning remembers the output for an application (not a single stream or browser tab) in `~/.config/pipewire-split/pinned_apps.json`. Pinned applications are routed to their saved output whenever their streams appear.
+* **Browser tabs**: routing is per PipeWire stream. Some browsers expose one stream per playing tab, others share one stream between tabs, so per-tab control depends on the browser. Tab titles come from MPRIS (`playerctl` or D-Bus) when available.
+* **Jack handling**: on unplug, non-pinned streams move to Speakers; on plug, you are asked where to route audio. Pinned apps are left alone by jack events.
+* **Tray and CLI**: tray icon with jack status, and CLI flags for window-manager keybindings (`--force-hp`, `--force-spk`, `--force-both`, `--toggle-mute`). Launching a second instance raises the existing window.
+
+---
+
+## Hardware compatibility
+
+**Tested on:** the author's laptop only: Realtek ALC285 (PCI `0000:65:00.6`), PipeWire 1.6 + WirePlumber on Arch Linux. `AUX0/AUX1` drive the headphone jack and `AUX2/AUX3` the internal speakers.
+
+**Requirement:** a codec/PCM that exposes **four independent playback channels** in the `pro-audio` profile, with two of them wired to the jack and two to the speakers. The wizard checks that `AUX0`-`AUX3` exist and refuses to write a configuration otherwise. Having four ports does not prove the wiring is independent, which is why the wizard also asks you to listen to both pairs.
+
+Machines that may **not** work: laptops with Intel SOF audio, and codecs where the jack and speakers share a DAC (they cannot be driven separately, whatever PipeWire exposes).
+
+If it works (or fails) on your hardware, please open an issue with your codec (`cat /proc/asound/card*/codec#* | grep Codec`), laptop model and what the wizard reported.
 
 ---
 
 ## Requirements
 
-* **Audio Stack**: `pipewire`, `wireplumber`, `pipewire-pulse` (or `pulseaudio-utils` for `pactl`), `alsa-utils` (`amixer`, `alsactl`)
-* **Runtime**: `python3`, `python-pyqt6`
-* **Optional**: `playerctl` (recommended for faster MPRIS browser tab title detection)
+* **Audio stack**: `pipewire`, `wireplumber`, `pipewire-pulse` (or `pulseaudio-utils` for `pactl`), `alsa-utils` (`amixer`, `alsactl`); `pw-play` (from the PipeWire tools) for the wizard
+* **Runtime**: `python3`, `python-pyqt6`, `libnotify` (`notify-send`)
+* **Optional**: `playerctl` (media titles for browser streams)
 
-### Install dependencies on Arch Linux:
 ```bash
-sudo pacman -S python python-pyqt6 pipewire pipewire-pulse wireplumber alsa-utils playerctl
-```
-
-### Install dependencies on Ubuntu / Debian / Fedora:
-```bash
+# Arch Linux
+sudo pacman -S python python-pyqt6 pipewire pipewire-pulse wireplumber alsa-utils libnotify playerctl
 # Ubuntu / Debian
-sudo apt install python3 python3-pyqt6 pipewire pipewire-pulse pulseaudio-utils alsa-utils playerctl
-
+sudo apt install python3 python3-pyqt6 pipewire pipewire-pulse pulseaudio-utils alsa-utils libnotify-bin playerctl
 # Fedora
-sudo dnf install python3 python3-pyqt6 pipewire pipewire-pulseaudio pulseaudio-utils alsa-utils playerctl
+sudo dnf install python3 python3-pyqt6 pipewire pipewire-pulseaudio pulseaudio-utils alsa-utils libnotify playerctl
 ```
 
 ---
 
-## Installation & Quick Start
+## Installation
 
 ```bash
-git clone [https://github.com/your-username/hda-pipewire-split.git](https://github.com/your-username/hda-pipewire-split.git)
+git clone https://github.com/mattiamelodia/hda-pipewire-split.git
 cd hda-pipewire-split
-chmod +x install.sh uninstall.sh
 ./install.sh
 ```
 
-1. **First-Time Calibration**: If `~/.config/pipewire-split/config.env` is missing, `install.sh` automatically launches the interactive wizard. Plug in your headphones, press `Enter` to hear a soft 440Hz tone, and confirm (`[Y/n]`) where the sound came from.
-2. **Native Sink Creation**: The wizard generates `~/.config/pipewire/pipewire.conf.d/99-hda-split.conf` and restarts PipeWire so the virtual sinks are immediately available system-wide.
+Or on Arch, build the package from the repository's `PKGBUILD` (`makepkg -si`).
+
+If `~/.config/pipewire-split/config.env` is missing, `install.sh` runs the wizard:
+
+1. It switches the card to `pro-audio` and disables ALSA Auto-Mute (the previous profile and Auto-Mute value are recorded for the uninstaller).
+2. Plug in headphones, then confirm for each pair of channels whether you heard the tone on the headphones, the speakers or nothing. The tone is soft, but the wizard does not change any volume, so lower your headphone volume first.
+3. It writes the config and the drop-in, restarts PipeWire and checks that the `Headphones`, `Speakers` and `Both` sinks appear.
 
 ---
 
 ## Usage
 
-Launch **HDA Audio Router** from your application launcher (Rofi, Wofi, GNOME, KDE) or via terminal:
-
 ```bash
-# Open the main GUI mixer
-hda-audio-control
-
-# Start minimized in the System Tray
-hda-audio-control --tray
-
-# Re-run the hardware discovery and AUX channel wizard
-hda-audio-control --wizard
+hda-audio-control            # open the mixer window
+hda-audio-control --tray     # start in the system tray
+hda-audio-control --wizard   # re-run discovery and calibration
 ```
 
-### CLI Shortcut Flags (Ideal for Hyprland / WM Keybindings):
 ```bash
-hda-audio-control --force-hp     # Route all active streams to Headphones
-hda-audio-control --force-spk    # Route all active streams to Speakers
-hda-audio-control --force-both   # Route all active streams to Both (Isolated)
-hda-audio-control --toggle-mute  # Toggle master mute on internal outputs
+hda-audio-control --force-hp     # route all active streams to Headphones
+hda-audio-control --force-spk    # route all active streams to Speakers
+hda-audio-control --force-both   # route all active streams to Both
+hda-audio-control --toggle-mute  # toggle mute on the internal outputs
 ```
 
-### Routing Controls per Stream:
-* **Headphones**: Routes stream exclusively to the 3.5mm jack.
-* **Speakers**: Routes stream exclusively to internal laptop speakers.
-* **Both**: Mirrors playback across both outputs simultaneously via an isolated stream-combine sink (no cross-talk with other streams).
-* **📌 Pin Toggle**: Saves application routing persistently in `pinned_apps.json`.
+**Pins vs. Force:** *Force All* (tray and CLI flags) is an explicit command and overrides pins. Jack events respect pins.
+
+**Both** mirrors a stream to the headphones and speakers through the `Both` combine sink.
+
+### Volume
+
+The app never raises ALSA hardware levels and its sliders stop at 100%. Because `pro-audio` routing bypasses the codec's normal mixer, the hardware gain may already be high: **start with the volume low when using headphones**.
 
 ---
 
-## Tested Hardware Compatibility Matrix
+## Troubleshooting
 
-| Laptop Model / Series | Audio Codec | AUX0 / AUX1 | AUX2 / AUX3 | Auto-Mute Control | Status |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **ASUS ROG Zephyrus (G14 / G16 / M16)** | Realtek ALC285 / ALC289 | Headphones | Internal Speakers | Present (`Disabled`) | ✅ Verified |
-| **ASUS TUF Gaming (A15 / F15)** | Realtek ALC256 / ALC285 | Headphones | Internal Speakers | Present (`Disabled`) | ✅ Verified |
-| **Lenovo ThinkPad (T14 / X1 Carbon / P1)** | Realtek ALC285 / ALC287 | Variable | Variable | Present (`Disabled`) | ✅ Verified via Wizard |
-| **Lenovo Legion / Yoga Slim 7** | Realtek ALC287 | Headphones | Internal Speakers | Present (`Disabled`) | ✅ Verified |
-| **Dell XPS (13 / 15 / 17)** | Realtek ALC289 / ALC295 | Headphones | Internal Speakers | Present (`Disabled`) | ✅ Verified |
-| **HP Spectre x360 / EliteBook** | Realtek ALC285 / ALC295 | Headphones | Internal Speakers | Present (`Disabled`) | ✅ Verified |
+```bash
+wpctl status | grep -E "Headphones|Speakers|Both"   # are the sinks loaded?
+python3 -m unittest discover -s tests -v            # unit tests
+```
+
+## Uninstallation
+
+```bash
+./uninstall.sh
+```
+
+It stops running instances, removes the app, launcher and PipeWire drop-in, restarts PipeWire and, when recorded in the config, restores the card's original profile and Auto-Mute value. Configs written by older versions have no recorded values; in that case it tries a standard analog profile and prints the manual `amixer` command. Volumes are not changed. Your configuration and pins are kept unless you answer `y` (or when there is no terminal).
 
 ---
 
-## Troubleshooting & Uninstallation
+## Project layout
 
-* **Verify native PipeWire virtual sinks are loaded:**
-  ```bash
-  wpctl status | grep -E "Headphones|Speakers|Both"
-  ```
-* **Run unit tests:**
-  ```bash
-  python3 -m unittest discover -s tests -v
-  ```
-* **Complete Uninstallation:**
-  ```bash
-  ./uninstall.sh
-  ```
+```text
+hda-pipewire-split/
+├── hda_split/
+│   ├── config.py       # discovery, config file, PipeWire drop-in generator
+│   ├── engine.py       # ALSA/PipeWire commands, routing, pins
+│   ├── monitor.py      # jack and PulseAudio event threads
+│   ├── mpris.py        # media title lookup (playerctl / D-Bus)
+│   └── gui.py          # PyQt6 window and tray
+├── main.py             # entry point (--tray, --wizard, --force-*)
+├── wizard.py           # discovery and channel calibration
+├── hda-audio-control.desktop
+├── install.sh / uninstall.sh
+├── PKGBUILD
+└── tests/
+```
+
+## License
+
+MIT, see [LICENSE](LICENSE).

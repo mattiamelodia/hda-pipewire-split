@@ -1,13 +1,23 @@
-import tempfile
-import unittest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+"""Core behaviour tests (config, pins, engine parsing, MPRIS, jack monitor).
 
-import hda_split.config as cfg_mod
-import hda_split.engine as eng_mod
-import hda_split.mpris as mpris_mod
-from hda_split.monitor import JackMonitorThread
+Run with:  python3 -m unittest discover -s tests -v
+Every test is hermetic: see tests/hermetic.py (no real pactl/amixer/pw-link/systemctl is ever executed).
+"""
 
+import os
+import sys
+from types import SimpleNamespace
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hermetic  # noqa: E402,F401  (must come before any Qt / hda_split import)
+from hermetic import FakeClock, FakeProc, HermeticTestCase  # noqa: E402
+
+import hda_split.config as cfg_mod  # noqa: E402
+import hda_split.engine as eng_mod  # noqa: E402
+import hda_split.monitor as mon_mod  # noqa: E402
+import hda_split.mpris as mpris_mod  # noqa: E402
+from hda_split.monitor import JackMonitorThread  # noqa: E402
 
 MOCK_PACTL_SINKS = """
 Sink #42
@@ -63,21 +73,7 @@ Sink Input #115
 """
 
 
-class TestHdaSplitSuite(unittest.TestCase):
-    def setUp(self):
-        self.tmp_dir = tempfile.TemporaryDirectory()
-        self.base = Path(self.tmp_dir.name)
-        cfg_mod.CONFIG_DIR = self.base / "config"
-        cfg_mod.CONFIG_FILE = cfg_mod.CONFIG_DIR / "config.env"
-        cfg_mod.PINS_FILE = cfg_mod.CONFIG_DIR / "pinned_apps.json"
-        cfg_mod.PW_CONF_DIR = self.base / "pipewire.conf.d"
-        cfg_mod.PW_DROPIN_FILE = cfg_mod.PW_CONF_DIR / "99-hda-split.conf"
-
-        eng_mod.PW_DROPIN_FILE = cfg_mod.PW_DROPIN_FILE
-
-    def tearDown(self):
-        self.tmp_dir.cleanup()
-
+class TestHdaSplitSuite(HermeticTestCase):
     def test_1_write_pipewire_dropin_includes_isolated_both_sink(self):
         """Verifies that the native drop-in creates Headphones, Speakers, and the isolated Both sink."""
         sample_cfg = {
@@ -92,6 +88,7 @@ class TestHdaSplitSuite(unittest.TestCase):
         }
         cfg_mod.save_config(sample_cfg)
         self.assertTrue(cfg_mod.PW_DROPIN_FILE.exists())
+        self.assertEqual(cfg_mod.PW_DROPIN_FILE, self.paths.PW_DROPIN_FILE)
 
         content = cfg_mod.PW_DROPIN_FILE.read_text()
         self.assertIn("libpipewire-module-loopback", content)
@@ -107,33 +104,25 @@ class TestHdaSplitSuite(unittest.TestCase):
         self.assertEqual(loaded.get("firefox"), "Speakers")
         self.assertEqual(loaded.get("discord"), "Headphones")
 
-    @patch("hda_split.engine.subprocess.run")
-    @patch("hda_split.engine.run_cmd", return_value="")
-    def test_3_isolated_route_stream_no_global_pw_link(self, _mock_cmd, mock_run):
-        """Verifies that routing to 'Both' moves only the input to the Both sink without global pw-links."""
-        engine = eng_mod.AudioEngine()
-        mock_run.reset_mock()
+    def test_3_isolated_route_stream_no_global_pw_link(self):
+        """Routing to 'Both' moves only the input to the Both sink, without any pw-link call."""
+        engine = self.make_engine()
+        self.sp.allow(["pactl", "move-sink-input"])
+        self.sp.reset()
 
         engine.route_stream("112", "Both")
-        calls = [c.args[0] for c in mock_run.call_args_list]
-        self.assertIn(["pactl", "move-sink-input", "112", "Both"], calls)
-        for cmd in calls:
-            self.assertNotIn("pw-link", cmd)
+        self.assertEqual(self.sp.argvs(), [["pactl", "move-sink-input", "112", "Both"]])
+        self.assertEqual(self.sp.find("pw-link"), [])
 
-    @patch("hda_split.engine.get_mpris_tab_titles", return_value={"firefox": "Lecture 04 - ML Security"})
-    @patch("hda_split.engine.run_cmd")
-    def test_4_stream_parsing_and_loopback_filtering(self, mock_cmd, _mock_mpris):
-        """Verifies that internal loopback streams are filtered and MPRIS titles are associated."""
-        def side_effect(args):
-            if args == ["pactl", "list", "sink-inputs"]:
-                return MOCK_PACTL_SINK_INPUTS
-            if args == ["pactl", "list", "sinks", "short"]:
-                return MOCK_PACTL_SINKS_SHORT
-            return ""
-
-        mock_cmd.side_effect = side_effect
-        engine = eng_mod.AudioEngine()
-        streams = engine.get_streams()
+    def test_4_stream_parsing_and_loopback_filtering(self):
+        """Internal loopback streams are filtered and MPRIS titles are associated."""
+        self.sp.stub(["pactl", "list", "sink-inputs"], stdout=MOCK_PACTL_SINK_INPUTS)
+        self.sp.stub(["pactl", "list", "sinks", "short"], stdout=MOCK_PACTL_SINKS_SHORT)
+        engine = self.make_engine()
+        with mock.patch.object(
+            eng_mod, "get_mpris_tab_titles", return_value={"firefox": "Lecture 04 - ML Security"}
+        ):
+            streams = engine.get_streams()
 
         self.assertEqual(len(streams), 1)
         s = streams[0]
@@ -142,11 +131,10 @@ class TestHdaSplitSuite(unittest.TestCase):
         self.assertEqual(s["media_title"], "Lecture 04 - ML Security")
         self.assertEqual(s["sink_name"], "Headphones")
 
-    @patch("hda_split.engine.run_cmd")
-    def test_5_sink_master_volumes_and_external_bluetooth_detection(self, mock_cmd):
+    def test_5_sink_master_volumes_and_external_bluetooth_detection(self):
         """Verifies Master volume reading and external Bluetooth headphone detection."""
-        mock_cmd.side_effect = lambda args: MOCK_PACTL_SINKS if args == ["pactl", "list", "sinks"] else ""
-        engine = eng_mod.AudioEngine()
+        self.sp.stub(["pactl", "list", "sinks"], stdout=MOCK_PACTL_SINKS)
+        engine = self.make_engine()
 
         info = engine.get_sink_info()
         self.assertEqual(info["Speakers"]["volume"], 75)
@@ -158,65 +146,74 @@ class TestHdaSplitSuite(unittest.TestCase):
         self.assertEqual(len(ext), 1)
         self.assertEqual(ext[0]["description"], "Sony WH-1000XM5")
 
-    @patch("hda_split.engine.run_cmd")
-    def test_6_dynamic_jack_detection_numid(self, mock_cmd):
+    def test_6_dynamic_jack_detection_numid(self):
         """Verifies dynamic parsing of Jack numid and reading of on/off state."""
-        def side_effect(args):
-            if "controls" in args:
-                return "numid=14,iface=CARD,name='Headphone Jack'\nnumid=15,iface=MIXER,name='Master Playback Volume'"
-            if "numid=14" in args:
-                return "numid=14,iface=CARD,name='Headphone Jack'\n  ; type=BOOLEAN,access=r-------,values=1\n  : values=on"
-            return ""
-
-        mock_cmd.side_effect = side_effect
-        engine = eng_mod.AudioEngine()
+        self.sp.stub(
+            ["amixer", "-c", "2", "controls"],
+            stdout="numid=14,iface=CARD,name='Headphone Jack'\nnumid=15,iface=MIXER,name='Master Playback Volume'",
+        )
+        self.sp.stub(
+            ["amixer", "-c", "2", "cget", "numid=14"],
+            stdout="numid=14,iface=CARD,name='Headphone Jack'\n  ; type=BOOLEAN,access=r-------,values=1\n  : values=on",
+        )
+        engine = self.make_engine()
         self.assertEqual(engine.jack_numid, "14")
         self.assertTrue(engine.is_headphone_plugged())
 
-    @patch("hda_split.monitor.shutil.which", return_value="/usr/bin/alsactl")
-    @patch("hda_split.monitor.subprocess.Popen")
-    def test_7_monitor_thread_emits_signal_and_recovers_on_eof(self, mock_popen, _mock_which):
-        """Verifies that JackMonitorThread emits the instant signal and recovers after an EOF (suspend)."""
-        mock_engine = MagicMock()
-        mock_engine.card_id = "2"
-        states = [False, True, True]
-        mock_engine.is_headphone_plugged.side_effect = lambda: states.pop(0) if states else True
+    def test_7_monitor_thread_emits_signal_and_recovers_on_eof(self):
+        """The jack thread reports a plug event, and after `alsactl monitor` ends (suspend/resume) it
+        signals hardware_resumed and starts a fresh `alsactl monitor hw:<card>` instead of dying."""
+        clock = FakeClock()
+        engine = SimpleNamespace(card_id="2")
+        plugged = iter([False, True])  # at thread start, then when the first monitor line arrives
+        engine.is_headphone_plugged = lambda: next(plugged, True)
 
-        proc_mock = MagicMock()
-        proc_mock.stdout = ["node hw:2, #14 (0,0,0,Headphone Jack,0) VALUE\n"]
-        mock_popen.return_value = proc_mock
+        thread = JackMonitorThread(engine)
+        thread.msleep = lambda ms: clock.sleep(ms / 1000)
+        events, resumed, launches = [], [], []
+        thread.jack_state_changed.connect(events.append)
+        thread.hardware_resumed.connect(lambda: resumed.append(True))
 
-        thread = JackMonitorThread(mock_engine)
-        received_events = []
-        resumed_called = []
+        def first_run():
+            yield "node hw:2, #14 (0,0,0,Headphone Jack,0) VALUE\n"
+            clock.advance(15.0)  # ran longer than STABLE_SECS, then EOF as on suspend
 
-        def on_change(state):
-            received_events.append(state)
-            thread._running = False
+        def second_run():
+            thread._running = False  # recovery happened; stop the loop
+            return iter(())
 
-        thread.jack_state_changed.connect(on_change)
-        thread.hardware_resumed.connect(lambda: resumed_called.append(True))
-        thread.run()
+        def popen_factory(argv):
+            launches.append(argv)
+            return FakeProc(argv, lines=first_run if len(launches) == 1 else second_run)
 
-        self.assertEqual(received_events, [True])
+        self.sp.stub(["stdbuf"], proc=popen_factory)
+        with mock.patch.object(mon_mod, "time", clock):
+            thread.run()
 
-    # --- NUOVI TEST AGGIUNTI (Ampliamento) ---
+        self.assertEqual(events, [True])
+        self.assertEqual(resumed, [True], "hardware_resumed must fire after a stable monitor exits")
+        self.assertEqual(len(launches), 2, "the monitor command must be restarted after EOF")
+        self.assertEqual(launches[0], launches[1])
+        self.assertEqual(launches[0][-3:], ["alsactl", "monitor", "hw:2"])
 
     def test_8_config_string_cleaning_and_defaults(self):
-        """Verifies string cleaning utility and default configuration loading."""
+        """Verifies string cleaning utility and default configuration loading (no config on disk)."""
         self.assertEqual(cfg_mod.clean_val('  "hello world"  '), "hello world")
         self.assertEqual(cfg_mod.clean_val(" 'test' "), "test")
         self.assertEqual(cfg_mod.clean_val(""), "")
 
+        self.assertFalse(cfg_mod.CONFIG_FILE.exists())
         cfg = cfg_mod.load_config()
-        self.assertIn("ALSA_CARD_ID", cfg)
-        self.assertIn("NODE_TARGET", cfg)
+        self.assertEqual(cfg["ALSA_CARD_ID"], cfg_mod.DEFAULT_CONFIG["ALSA_CARD_ID"])
+        self.assertEqual(cfg["NODE_TARGET"], cfg_mod.DEFAULT_CONFIG["NODE_TARGET"])
+        self.assertFalse(cfg_mod.CONFIG_FILE.exists(), "load_config must not create the file")
 
     def test_9_engine_pin_management(self):
-        """Verifies pin and unpin operations within AudioEngine."""
+        """Verifies pin and unpin operations within AudioEngine (persisted in the temp dir only)."""
         engine = eng_mod.AudioEngine()
         engine.pin_app("spotify", "Headphones")
         self.assertEqual(engine.pinned_apps.get("spotify"), "Headphones")
+        self.assertEqual(cfg_mod.load_pinned_apps(), {"spotify": "Headphones"})
 
         engine.unpin_app("spotify")
         self.assertNotIn("spotify", engine.pinned_apps)
@@ -224,16 +221,21 @@ class TestHdaSplitSuite(unittest.TestCase):
         engine.pin_app("vlc", "Speakers")
         engine.clear_all_pins()
         self.assertEqual(len(engine.pinned_apps), 0)
+        self.assertEqual(cfg_mod.load_pinned_apps(), {})
+        self.assertTrue(str(cfg_mod.PINS_FILE).startswith(str(self.base)))
 
-    @patch("hda_split.mpris.run_cmd")
-    @patch("hda_split.mpris.shutil.which", return_value="/usr/bin/playerctl")
-    def test_10_mpris_playerctl_title_resolution(self, _mock_which, mock_run):
+    def test_10_mpris_playerctl_title_resolution(self):
         """Verifies MPRIS browser tab and media title resolution via playerctl."""
-        mock_run.return_value = "firefox: YouTube Video Title\nspotify: Song Name"
+        self.sp.stub(
+            ["playerctl"], stdout="firefox: YouTube Video Title\nspotify: Song Name"
+        )
         titles = mpris_mod.get_mpris_tab_titles()
         self.assertEqual(titles.get("firefox"), "YouTube Video Title")
         self.assertEqual(titles.get("spotify"), "Song Name")
+        self.assertEqual(self.sp.find("playerctl")[0][:3], ["playerctl", "-a", "metadata"])
 
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main(verbosity=2)

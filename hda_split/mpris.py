@@ -2,7 +2,7 @@ import re
 import shutil
 from typing import Dict
 
-from .config import clean_val, run_cmd
+from .config import run_cmd
 
 MPRIS_PLAYER_REGEX = re.compile(r'string "org\.mpris\.MediaPlayer2\.([^"]+)"')
 MPRIS_TITLE_REGEX = re.compile(
@@ -20,7 +20,7 @@ def get_mpris_tab_titles() -> Dict[str, str]:
     if shutil.which("playerctl"):
         out = run_cmd(["playerctl", "-a", "metadata", "--format", "{{playerName}}: {{title}}"])
         for raw_line in out.splitlines():
-            line = clean_val(raw_line)
+            line = raw_line.strip()
             if ":" in line:
                 player, title = line.split(":", 1)
                 title = title.strip()
@@ -43,6 +43,7 @@ def get_mpris_tab_titles() -> Dict[str, str]:
             meta_raw = run_cmd([
                 "dbus-send",
                 "--session",
+                "--reply-timeout=500",
                 f"--dest={bus_name}",
                 "--type=method_call",
                 "--print-reply",

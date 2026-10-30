@@ -11,10 +11,11 @@ BIN_TARGET="$BIN_DIR/hda-audio-control"
 DESKTOP_DIR="$HOME/.local/share/applications"
 DESKTOP_TARGET="$DESKTOP_DIR/hda-audio-control.desktop"
 
-REQUIRED_CMDS=("pactl" "pw-loopback" "pw-link" "amixer" "alsactl" "python3")
+REQUIRED_CMDS=("pactl" "pw-link" "pw-play" "amixer" "alsactl" "python3")
+OPTIONAL_CMDS=("notify-send:libnotify (desktop notifications)" "playerctl:playerctl (browser tab titles)")
 
 echo "=========================================================="
-echo "    Universal HDA PipeWire Audio Hub - Installer (v1.0)"
+echo "    HDA PipeWire Audio Splitter - Installer"
 echo "=========================================================="
 
 # 1. Check essential dependencies
@@ -31,6 +32,14 @@ if [ "${#missing_deps[@]}" -gt 0 ]; then
     exit 1
 fi
 
+for entry in "${OPTIONAL_CMDS[@]}"; do
+    cmd="${entry%%:*}"
+    desc="${entry#*:}"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "[!] Warning: '$cmd' not found; install $desc for full functionality." >&2
+    fi
+done
+
 if ! python3 -c "import PyQt6" >/dev/null 2>&1; then
     echo "[-] Error: Python module 'PyQt6' not found." >&2
     echo "    Install the system package (e.g. 'sudo pacman -S python-pyqt6' or 'sudo apt install python3-pyqt6')." >&2
@@ -40,7 +49,10 @@ fi
 # 2. Copy modules, scripts, and custom icon
 echo "==> Installing modules and assets to $APP_SHARE..."
 mkdir -p "$APP_SHARE" "$BIN_DIR" "$DESKTOP_DIR" "$CONFIG_DIR"
+# Replace the package wholesale so removed modules and stale bytecode do not linger.
+rm -rf "$APP_SHARE/hda_split"
 cp -rf "$SCRIPT_DIR/hda_split" "$SCRIPT_DIR/main.py" "$SCRIPT_DIR/wizard.py" "$SCRIPT_DIR/icon.png" "$APP_SHARE/"
+find "$APP_SHARE" -name '__pycache__' -type d -prune -exec rm -rf {} +
 chmod +x "$APP_SHARE/main.py" "$APP_SHARE/wizard.py"
 
 # 3. Create binary wrapper in ~/.local/bin
@@ -53,7 +65,10 @@ chmod +x "$BIN_TARGET"
 # 4. Calibration and PipeWire configuration if not present
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "==> Calibration file not found. Starting wizard automatically..."
-    "$BIN_TARGET" --wizard
+    if ! "$BIN_TARGET" --wizard; then
+        echo "[!] The wizard did not complete; no split was configured." >&2
+        echo "    The launcher is still installed. Re-run it with: hda-audio-control --wizard" >&2
+    fi
 else
     PYTHONPATH="$APP_SHARE" python3 -c "from hda_split.config import load_config, write_pipewire_dropin; write_pipewire_dropin(load_config())"
     systemctl --user restart pipewire 2>/dev/null || true

@@ -1,27 +1,45 @@
 # Maintainer: Mattia Melodia
 pkgname=hda-pipewire-split-git
-pkgver=1.0.0
+_pkgname=hda-pipewire-split
+pkgver=r2.fe01036
 pkgrel=1
-pkgdesc="Universal Realtek HDA PipeWire dual-output splitter, isolated Both sink and per-tab router"
+pkgdesc="Split a Realtek HDA card's pro-audio PipeWire node into Headphones, Speakers and Both sinks, with a per-application router"
 arch=('any')
-url="https://github.com/mattiamelodia/alc285-pipewire-split"
+url="https://github.com/mattiamelodia/hda-pipewire-split"
 license=('MIT')
-depends=('python' 'python-pyqt6' 'pipewire' 'pipewire-pulse' 'wireplumber' 'alsa-utils')
-optdepends=('playerctl: Enhanced MPRIS browser tab title detection')
-provides=('hda-audio-control')
+depends=('python' 'python-pyqt6' 'pipewire' 'pipewire-pulse' 'wireplumber' 'alsa-utils' 'libnotify')
+makedepends=('git')
+optdepends=('playerctl: MPRIS media title lookup for application names')
+provides=('hda-audio-control' 'hda-pipewire-split')
+conflicts=('hda-pipewire-split')
+source=("git+https://github.com/mattiamelodia/hda-pipewire-split.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/$_pkgname"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
 
 package() {
-    install -d "$pkgdir/usr/lib/hda-pipewire-split"
-    cp -r "$srcdir/hda_split" "$srcdir/main.py" "$srcdir/wizard.py" "$srcdir/icon.png" \
-        "$pkgdir/usr/lib/hda-pipewire-split/"
+    cd "$srcdir/$_pkgname"
+
+    local libdir="$pkgdir/usr/lib/hda-pipewire-split"
+
+    # Python package (sources only, no __pycache__)
+    find hda_split -type f -name '*.py' -exec install -Dm644 {} "$libdir/{}" \;
+    install -Dm755 main.py "$libdir/main.py"
+    install -Dm755 wizard.py "$libdir/wizard.py"
+    # config.py falls back to <install dir>/icon.png for the notification and window icon
+    install -Dm644 icon.png "$libdir/icon.png"
 
     install -d "$pkgdir/usr/bin"
-    cat << 'EOF' > "$pkgdir/usr/bin/hda-audio-control"
+    cat > "$pkgdir/usr/bin/hda-audio-control" << 'WRAPPER'
 #!/usr/bin/env bash
 exec python3 /usr/lib/hda-pipewire-split/main.py "$@"
-EOF
+WRAPPER
     chmod 755 "$pkgdir/usr/bin/hda-audio-control"
 
-    install -Dm644 "$srcdir/icon.png" "$pkgdir/usr/share/pixmaps/hda-pipewire-split.png"
-    install -Dm644 "$srcdir/hda-audio-control.desktop" "$pkgdir/usr/share/applications/hda-audio-control.desktop"
+    install -Dm644 icon.png "$pkgdir/usr/share/pixmaps/hda-pipewire-split.png"
+    install -Dm644 hda-audio-control.desktop "$pkgdir/usr/share/applications/hda-audio-control.desktop"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
