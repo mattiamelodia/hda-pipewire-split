@@ -14,7 +14,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hermetic  # noqa: E402,F401
 from hermetic import HermeticTestCase, get_qapp, sink_input, sinks_full, sinks_short, wait_until  # noqa: E402
 
-import hda_split.config as cfg_mod  # noqa: E402
 import hda_split.engine as eng_mod  # noqa: E402
 import main as main_mod  # noqa: E402
 
@@ -121,13 +120,6 @@ class CliPathsTests(MainBase):
                 self.assertIn(f"Routed 1 active stream(s) to {sink}", out)
                 self.assertIn(["pactl", "set-default-sink", sink], self.sp.argvs())
                 self.assertIn(["pactl", "move-sink-input", "5", sink], self.sp.argvs())
-
-    def test_force_flags_override_pins_because_the_user_asked_explicitly(self):
-        self.configure()
-        self.sinks()
-        cfg_mod.save_pinned_apps({"firefox": "Speakers"})
-        self.run_main("--force-hp")
-        self.assertIn(["pactl", "move-sink-input", "5", "Headphones"], self.sp.argvs())
 
     def test_toggle_mute_does_not_call_ensure_hardware_ready_or_touch_alsa(self):
         self.configure()

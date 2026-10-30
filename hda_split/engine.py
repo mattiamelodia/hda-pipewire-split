@@ -10,11 +10,10 @@ from .config import (
     clean_val,
     command_env,
     load_config,
-    load_pinned_apps,
     render_pipewire_dropin,
     resolve_card_index,
+    restore_silenced_levels,
     run_cmd,
-    save_pinned_apps,
     write_pipewire_dropin,
 )
 from .mpris import get_mpris_tab_titles
@@ -23,11 +22,6 @@ log = logging.getLogger("hda_split")
 
 PERCENT_RE = re.compile(r"(\d+)%")
 
-# Launchers/runtimes whose binary says nothing about the app: key on application.name instead.
-GENERIC_RUNTIME_RE = re.compile(
-    r"^(electron\d*|python[\d.]*|java|node(js)?|deno|bun|wine(64)?(-preloader)?|wine64-preloader"
-    r"|sh|bash|dash|zsh|fish|mono|dotnet|ruby|perl|php)$"
-)
 # Browsers sharing the Chromium MPRIS/audio conventions; their player ids are interchangeable.
 CHROMIUM_FAMILY = {
     "chrome", "chromium", "googlechrome", "chromiumbrowser", "brave", "bravebrowser", "bravebeta",
@@ -45,15 +39,21 @@ class AudioEngine:
     INTERNAL_NODE_PREFIXES = ("playback.headphones", "playback.speakers", "output.", "loopback-")
     INTERNAL_GROUP_PREFIXES = ("pw-loopback-", "loopback-", "combine-sink-")
     RESTART_COOLDOWN = 30.0
+    RECOVERY_GRACE = 3.0
+    RECOVERY_MAX_ATTEMPTS = 3
+    PROFILE_SAVE_DELAY = 1.5
 
     def __init__(self) -> None:
-        self.pinned_apps: Dict[str, str] = load_pinned_apps()
+        # Streams the user moved by hand (stream id -> sink); they stay put across jack events until they close.
+        self.manual_routes: Dict[str, str] = {}
         self.cfg: Dict[str, str] = {}
         self.card_id: str = "0"
         self.card_name: str = ""
         self.target_node: str = ""
         self.jack_numid: Optional[str] = None
         self._last_restart: float = 0.0
+        self._sinks_missing_since: Optional[float] = None
+        self._recovery_attempts: int = 0
 
         self.reload_configuration()
 
@@ -112,7 +112,7 @@ class AudioEngine:
         return "values=on" in out.lower()
 
     def ensure_hardware_ready(self) -> None:
-        """Selects the pro-audio profile, disables Auto-Mute and unmutes the amps. Never touches volume."""
+        """Selects the pro-audio profile, disables Auto-Mute, unmutes the amps and rescues levels stuck at 0%."""
         if self.card_name:
             self._run_silent(["pactl", "set-card-profile", self.card_name, "pro-audio"])
 
@@ -125,6 +125,8 @@ class AudioEngine:
         for ctrl in ("Master", "Speaker", "Headphone", "Bass Speaker"):
             if f"'{ctrl}'," in scontrols:
                 self._run_silent(["amixer", "-c", self.card_id, "set", ctrl, "unmute"])
+
+        restore_silenced_levels(self.card_id, self.target_node)
 
     def _sink_names(self) -> List[str]:
         """Exact sink names from column 2 of `pactl list sinks short`."""
@@ -139,13 +141,24 @@ class AudioEngine:
         names = set(self._sink_names())
         return all(s in names for s in self.INTERNAL_SINKS)
 
+    def _card_is_listed(self) -> bool:
+        cards = [line.split()[1] for line in run_cmd(["pactl", "list", "cards", "short"]).splitlines() if len(line.split()) >= 2]
+        return not self.card_name or self.card_name in cards
+
     def _wait_for_sinks(self, timeout: float = 5.0, step: float = 0.25) -> bool:
+        """Waits for the sinks and for the card: a profile request sent before it is listed fails."""
         deadline = time.monotonic() + timeout
         while True:
-            if self._internal_sinks_present():
+            if self._internal_sinks_present() and self._card_is_listed():
                 return True
             if time.monotonic() >= deadline:
                 return False
+            time.sleep(step)
+
+    def _wait_for_target_node(self, steps: int = 8, step: float = 0.25) -> None:
+        for _ in range(steps):
+            if self.target_node in self._sink_names():
+                return
             time.sleep(step)
 
     def ensure_sinks_exist(self, force_reload: bool = False) -> bool:
@@ -170,6 +183,7 @@ class AudioEngine:
             if not self._wait_for_sinks():
                 log.warning("Headphones/Speakers/Both sinks did not appear within 5s of restarting PipeWire")
             self.ensure_hardware_ready()
+            self._wait_for_target_node()
 
         # Ensure physical ports are always connected
         self.enforce_hardware_links()
@@ -177,6 +191,45 @@ class AudioEngine:
         if present:
             self._set_both_to_unity()
         return present
+
+    @property
+    def recovery_exhausted(self) -> bool:
+        return self._recovery_attempts >= self.RECOVERY_MAX_ATTEMPTS
+
+    def recover_missing_sinks(self) -> bool:
+        """
+        Rebuilds the audio path if it stays broken, e.g. after a card profile switch removed the hardware node.
+        Bounded by a grace period, the restart cooldown and an attempt limit. Returns True if the path is complete.
+        """
+        names = set(self._sink_names())
+        if all(s in names for s in self.INTERNAL_SINKS) and self.target_node in names:
+            self._sinks_missing_since = None
+            self._recovery_attempts = 0
+            return True
+        if not run_cmd(["pactl", "info"]):
+            return False
+
+        now = time.monotonic()
+        if self._sinks_missing_since is None:
+            self._sinks_missing_since = now
+            return False
+        if (
+            now - self._sinks_missing_since < self.RECOVERY_GRACE
+            or now - self._last_restart < self.RESTART_COOLDOWN
+            or self.recovery_exhausted
+        ):
+            return False
+
+        self._recovery_attempts += 1
+        log.warning(
+            "Audio path is broken; restoring pro-audio and restarting PipeWire (attempt %d of %d)",
+            self._recovery_attempts,
+            self.RECOVERY_MAX_ATTEMPTS,
+        )
+        # Select pro-audio before the restart and give WirePlumber time to save it, so the restart restores it
+        self.ensure_hardware_ready()
+        time.sleep(self.PROFILE_SAVE_DELAY)
+        return self.ensure_sinks_exist(force_reload=True)
 
     def _set_both_to_unity(self) -> None:
         """Both only duplicates the signal into Headphones and Speakers, so it must not attenuate it."""
@@ -268,29 +321,44 @@ class AudioEngine:
         """Sets the system default sink without touching ALSA hardware."""
         self._run_silent(["pactl", "set-default-sink", target])
 
-    def force_all_streams(self, target: str, respect_pins: bool = False) -> int:
-        """Makes `target` the default sink and moves every stream there (optionally skipping pinned apps)."""
+    def _prepare_output(self, target: str) -> None:
         self.set_default_target(target)
         self.ensure_hardware_ready()
         self.enforce_hardware_links()
         if target == "Both":
             self._set_both_to_unity()
 
+    def choose_output(self, stream_id: str, target: str) -> bool:
+        """Moves one stream by hand. The choice survives jack events until the stream closes."""
+        if not self.route_stream(stream_id, target):
+            return False
+        self.manual_routes[str(stream_id)] = target
+        return True
+
+    def follow_jack(self, plugged: bool) -> int:
+        """Audio follows the jack, except streams moved by hand. Returns the number of streams moved."""
+        jack_target = "Headphones" if plugged else "Speakers"
+        self._prepare_output(jack_target)
+
         moved = 0
         for s in self.get_streams():
-            if respect_pins and s["app_key"] in self.pinned_apps:
-                continue
+            target = self.manual_routes.get(s["id"], jack_target)
+            if target == "Headphones" and not plugged:
+                target = "Speakers"  # never leave a stream on an output that is not connected
             if s["sink_name"] != target and self.route_stream(s["id"], target):
                 moved += 1
         return moved
 
-    def apply_pins(self, streams: List[Dict[str, Any]]) -> None:
-        """Moves every stream of a pinned app to its pinned sink; updates s['sink_name'] of moved streams."""
-        for s in streams:
-            pinned = self.pinned_apps.get(s.get("app_key", ""))
-            if pinned and s.get("sink_name") != pinned:
-                if self.route_stream(s["id"], pinned):
-                    s["sink_name"] = pinned
+    def force_all_streams(self, target: str) -> int:
+        """Explicit command: moves every stream to `target` and replaces any choice made by hand."""
+        self.manual_routes.clear()
+        self._prepare_output(target)
+
+        moved = 0
+        for s in self.get_streams():
+            if s["sink_name"] != target and self.route_stream(s["id"], target):
+                moved += 1
+        return moved
 
     def get_sink_info(self) -> Dict[str, Dict[str, Any]]:
         """Returns volume/mute state of all sinks and lists any external sinks (USB/BT)."""
@@ -362,29 +430,6 @@ class AudioEngine:
         for s in ("Headphones", "Speakers"):
             self.set_sink_mute(s, new_mute)
         return new_mute
-
-    # --- Application Pinning ---
-    @staticmethod
-    def get_app_key(stream_data: Dict[str, Any]) -> str:
-        app = (stream_data.get("app") or "").strip().lower()
-        binary = (stream_data.get("binary") or "").strip().lower()
-        if app and GENERIC_RUNTIME_RE.match(binary):
-            return app
-        return binary or app
-
-    def pin_app(self, app_key: str, target_sink: str) -> None:
-        if app_key:
-            self.pinned_apps[app_key] = target_sink
-            save_pinned_apps(self.pinned_apps)
-
-    def unpin_app(self, app_key: str) -> None:
-        if app_key and app_key in self.pinned_apps:
-            del self.pinned_apps[app_key]
-            save_pinned_apps(self.pinned_apps)
-
-    def clear_all_pins(self) -> None:
-        self.pinned_apps.clear()
-        save_pinned_apps(self.pinned_apps)
 
     # --- Stream Discovery ---
     @classmethod
@@ -506,8 +551,12 @@ class AudioEngine:
             if not s["app"] and not s["binary"] and not s["pid"]:
                 continue
             s["sink_name"] = sink_map.get(s["sink_id"], "")
-            s["app_key"] = self.get_app_key(s)
             valid_streams.append(s)
+
+        open_ids = {s["id"] for s in streams}
+        for stream_id in list(self.manual_routes):
+            if stream_id not in open_ids:
+                del self.manual_routes[stream_id]
 
         if valid_streams:
             self._apply_mpris_titles(valid_streams, get_mpris_tab_titles())

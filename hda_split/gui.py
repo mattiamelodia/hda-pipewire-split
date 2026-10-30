@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Set
 
 from PyQt6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QHideEvent, QIcon, QShowEvent
@@ -13,7 +13,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
-    QMessageBox,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -32,6 +31,7 @@ log = logging.getLogger(__name__)
 # Hearing safety: sliders never go above 100% (PipeWire may report more; the label shows the real value)
 MAX_SLIDER_VOLUME = 100
 INTERNAL_SINK_NAMES = {"headphones": "Headphones", "speakers": "Speakers", "both": "Both"}
+MISSING_OUTPUT_TOOLTIP = "This output is not available right now. Try Repair."
 
 # --- Stylesheets ---
 MODERN_STYLESHEET = """
@@ -133,25 +133,6 @@ QPushButton.SegmentBtn:checked {
     background-color: #27272a;
     color: #ffffff;
     font-weight: 600;
-}
-
-/* Pin Button */
-QPushButton#PinBtn {
-    background-color: #1e1e22;
-    border: 1px solid #27272a;
-    border-radius: 7px;
-    color: #71717a;
-    font-size: 13px;
-    padding: 4px;
-}
-QPushButton#PinBtn:hover {
-    background-color: #27272a;
-    color: #a1a1aa;
-}
-QPushButton#PinBtn:checked {
-    background-color: #1e3a5f;
-    border: 1px solid #2563eb;
-    color: #60a5fa;
 }
 
 /* Volume Slider */
@@ -371,6 +352,7 @@ class MasterSinkControl(QWidget):
         self.gui.run_async(lambda: self.gui.engine.set_sink_mute(self.sink_name, muted))
 
     def update_state(self, sink_data: Optional[Dict[str, Any]]) -> None:
+        self.setEnabled(bool(sink_data))
         if not sink_data:
             return
         if not self.slider.isSliderDown() and not self._vol_sender.busy():
@@ -386,21 +368,19 @@ class MasterSinkControl(QWidget):
 
 
 class StreamRow(QFrame):
-    """Represents an individual application audio stream with routing, pinning, and volume controls."""
+    """Represents an individual application audio stream with routing and volume controls."""
 
     def __init__(self, stream_data: Dict[str, Any], parent_gui: "AppWindow") -> None:
         super().__init__()
         self.stream_id: str = stream_data["id"]
-        self.app_key: str = stream_data.get("app_key", "")
         self.gui = parent_gui
-        self.current_sink: str = ""
         self.setProperty("class", "StreamCard")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(10)
 
-        # Top row: Metadata + Routing Buttons + Pin Button
+        # Top row: Metadata + Routing Buttons
         top_row = QHBoxLayout()
         top_row.setSpacing(10)
 
@@ -449,14 +429,6 @@ class StreamRow(QFrame):
 
         top_row.addWidget(seg_frame, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        self.btn_pin = QPushButton("📌")
-        self.btn_pin.setObjectName("PinBtn")
-        self.btn_pin.setCheckable(True)
-        self.btn_pin.setFixedSize(28, 28)
-        self.btn_pin.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_pin.toggled.connect(self.on_pin_toggled)
-        top_row.addWidget(self.btn_pin, alignment=Qt.AlignmentFlag.AlignVCenter)
-
         self.btn_hp.clicked.connect(lambda: self.manual_route("Headphones"))
         self.btn_spk.clicked.connect(lambda: self.manual_route("Speakers"))
         self.btn_both.clicked.connect(lambda: self.manual_route("Both"))
@@ -496,53 +468,13 @@ class StreamRow(QFrame):
 
         self.update_data(stream_data)
 
-    def refresh_pin_state(self) -> None:
-        """Mirrors engine.pinned_apps onto the pin button (signals blocked, no side effects)."""
-        pinned = bool(self.app_key) and self.app_key in self.gui.engine.pinned_apps
-        self.btn_pin.blockSignals(True)
-        self.btn_pin.setChecked(pinned)
-        self.btn_pin.blockSignals(False)
-
-        if self.app_key:
-            self.btn_pin.setEnabled(True)
-            self.btn_pin.setToolTip(
-                "Persistent Pin: remembers this application's output across restarts and jack events.\n"
-                "Pins apply per application, not per tab or stream."
-            )
-        else:
-            self.btn_pin.setEnabled(False)
-            self.btn_pin.setToolTip("Cannot pin: this application could not be identified")
-
-    def on_pin_toggled(self, checked: bool) -> None:
-        if not self.app_key:
-            self.refresh_pin_state()
-            return
-
-        if checked:
-            target = INTERNAL_SINK_NAMES.get(self.current_sink.lower())
-            if target is None:
-                # Stream is on an external (Bluetooth/USB) sink: refuse rather than mis-pin it
-                self.btn_pin.blockSignals(True)
-                self.btn_pin.setChecked(False)
-                self.btn_pin.blockSignals(False)
-                self.gui.flash("Can only pin a stream routed to Headphones, Speakers or Both", 3500)
-                return
-            self.gui.engine.pin_app(self.app_key, target)
-        else:
-            self.gui.engine.unpin_app(self.app_key)
-
-        self.gui.sync_pin_buttons()
-
     def manual_route(self, target: str) -> None:
-        """Moves only this stream, live. If its application is pinned, the pin follows the choice."""
+        """Moves only this stream, live; it then stays there across jack events until it closes."""
         stream_id = self.stream_id
-        self.current_sink = target
         self.gui.run_async(
-            lambda: self.gui.engine.route_stream(stream_id, target),
+            lambda: self.gui.engine.choose_output(stream_id, target),
             on_done=lambda _r: self.gui.schedule_refresh(),
         )
-        if self.app_key and self.app_key in self.gui.engine.pinned_apps:
-            self.gui.engine.pin_app(self.app_key, target)
 
     def on_vol_change(self, val: int) -> None:
         self.vol_lbl.setText(f"{val}%")
@@ -552,6 +484,12 @@ class StreamRow(QFrame):
         self.mute_btn.setText("Muted" if is_muted else "Mute")
         stream_id = self.stream_id
         self.gui.run_async(lambda: self.gui.engine.set_stream_mute(stream_id, is_muted))
+
+    def set_available_sinks(self, available: Set[str]) -> None:
+        """A missing output can't receive the stream: disable its button instead of letting the click do nothing."""
+        for sink, button in (("Headphones", self.btn_hp), ("Speakers", self.btn_spk), ("Both", self.btn_both)):
+            button.setEnabled(sink in available)
+            button.setToolTip("" if sink in available else MISSING_OUTPUT_TOOLTIP)
 
     def update_data(self, data: Dict[str, Any]) -> None:
         app = data.get("app") or data.get("binary") or "Application"
@@ -572,8 +510,7 @@ class StreamRow(QFrame):
         self.app_badge.setText(app.upper())
         self.pid_lbl.setText(f"PID {data['pid']}" if data.get("pid") else "")
 
-        self.current_sink = data.get("sink_name", "")
-        current_sink = self.current_sink.lower()
+        current_sink = data.get("sink_name", "").lower()
         for b in (self.btn_hp, self.btn_spk, self.btn_both):
             b.blockSignals(True)
 
@@ -599,12 +536,12 @@ class StreamRow(QFrame):
         self.mute_btn.setText("Muted" if data["muted"] else "Mute")
         self.mute_btn.blockSignals(False)
 
-        self.refresh_pin_state()
 
 
 # --- Main Application Window ---
 class AppWindow(QMainWindow):
     REFRESH_DEBOUNCE_MS = 150
+    RECOVERY_RETRY_MS = 4000
     SLOW_REFRESH_MS = 5000
     SHUTDOWN_WAIT_MS = 3000
 
@@ -620,10 +557,11 @@ class AppWindow(QMainWindow):
         self._force_quit: bool = False
         self._closing: bool = False
         self._sinks_ok: bool = True
+        self._available_sinks: Set[str] = set(INTERNAL_SINK_NAMES.values())
+        self.tray_force_actions: Dict[str, QAction] = {}
         self._started: bool = False
         self._external_count: int = 0
         self._flash_until: float = 0.0
-        self._plug_dialog: Optional[QMessageBox] = None
         self._refresh_inflight: bool = False
         self._refresh_again: bool = False
 
@@ -642,6 +580,11 @@ class AppWindow(QMainWindow):
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(self.REFRESH_DEBOUNCE_MS)
         self._refresh_timer.timeout.connect(self.request_refresh)
+
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setSingleShot(True)
+        self._recovery_timer.setInterval(self.RECOVERY_RETRY_MS)
+        self._recovery_timer.timeout.connect(self.request_refresh)
 
         # Slow tick (MPRIS titles have no event source); only runs while the window is visible
         self._slow_timer = QTimer(self)
@@ -750,17 +693,11 @@ class AppWindow(QMainWindow):
         title_box.addWidget(subtitle)
         header.addLayout(title_box, stretch=1)
 
-        unpin_btn = QPushButton("Reset Pins")
-        unpin_btn.setProperty("class", "HeaderBtn")
-        unpin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        unpin_btn.clicked.connect(self.unpin_all_streams)
-
         self.fix_btn = QPushButton("Repair")
         self.fix_btn.setProperty("class", "HeaderBtn")
         self.fix_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.fix_btn.clicked.connect(self.on_manual_fix)
 
-        header.addWidget(unpin_btn)
         header.addWidget(self.fix_btn)
         layout.addLayout(header)
 
@@ -836,6 +773,7 @@ class AppWindow(QMainWindow):
             action = QAction(label, self)
             action.triggered.connect(lambda checked=False, t=target: self.force_all_streams(t))
             self.tray_menu.addAction(action)
+            self.tray_force_actions[target] = action
 
         self.tray_menu.addSeparator()
         act_quit = QAction("Quit", self)
@@ -881,7 +819,7 @@ class AppWindow(QMainWindow):
 
     # --- Routing & Hardware Events ---
     def force_all_streams(self, target_sink: str) -> None:
-        """Explicit user command (tray): overrides pins."""
+        """Explicit user command (tray): moves everything, including streams moved by hand."""
         self.flash(f"Routing all streams to {target_sink}...", 10000)
 
         def done(moved: Any) -> None:
@@ -896,94 +834,21 @@ class AppWindow(QMainWindow):
         )
 
     def on_jack_event(self, plugged: bool) -> None:
+        """One rule, no questions: audio follows the jack, except streams moved by hand."""
         self.update_tray_jack_status(plugged)
+        target = "Headphones" if plugged else "Speakers"
+        title = "Jack Connected" if plugged else "Jack Unplugged"
 
-        if not plugged:
-            self._close_plug_dialog()
-
-            def done(moved: Any) -> None:
-                self.flash(f"Jack unplugged: switched {moved} stream(s) to Speakers", 3500)
-                self.notify("Jack Unplugged", f"Switched {moved} stream(s) to Speakers", urgency="normal")
-                self.schedule_refresh()
-
-            self.run_async(
-                lambda: self.engine.force_all_streams("Speakers", respect_pins=True),
-                on_done=done,
-                on_error=lambda exc: self.flash(f"Jack unplugged: routing failed: {exc}", 4000),
-            )
-        else:
-            # Re-activate ALSA hardware (auto-mute etc.) before the user picks a destination
-            self.run_async(self._restore_hardware, on_done=lambda _r: self.schedule_refresh())
-            self._show_plug_dialog()
-
-    def _show_plug_dialog(self) -> None:
-        if self._plug_dialog is not None:
-            return  # already asking; never stack dialogs
-
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Headphones Plugged In")
-        msg.setText("Where do you want to route the audio?")
-        msg.setIcon(QMessageBox.Icon.Question)
-
-        btn_hp = msg.addButton("Headphones Only", QMessageBox.ButtonRole.AcceptRole)
-        btn_spk = msg.addButton("Speakers Only", QMessageBox.ButtonRole.ActionRole)
-        btn_both = msg.addButton("Both (Split)", QMessageBox.ButtonRole.ActionRole)
-        btn_keep = msg.addButton("Keep Current", QMessageBox.ButtonRole.RejectRole)
-        msg.setDefaultButton(btn_hp)
-        # Esc / window close must be harmless: never route audio out of the speakers by accident
-        msg.setEscapeButton(btn_keep)
-
-        choices = {btn_hp: "Headphones", btn_spk: "Speakers", btn_both: "Both"}
-
-        def on_clicked(button: Any) -> None:
-            if self._plug_dialog is not msg:
-                return
-            target = choices.get(button)
-            if target is None:
-                self.flash("Headphones connected: routing unchanged", 3500)
-                return
-            self._answer_plug_dialog(target)
-
-        msg.buttonClicked.connect(on_clicked)
-        msg.finished.connect(lambda _r, m=msg: self._on_plug_dialog_finished(m))
-
-        self._plug_dialog = msg
-        msg.setWindowModality(Qt.WindowModality.NonModal)
-        msg.show()
-        msg.raise_()
-        msg.activateWindow()
-
-    def _answer_plug_dialog(self, target: str) -> None:
         def done(moved: Any) -> None:
-            self.flash(f"Headphones connected: {moved} stream(s) routed to {target}", 3500)
+            self.flash(f"{title}: switched {moved} stream(s) to {target}", 3500)
+            self.notify(title, f"Switched {moved} stream(s) to {target}", urgency="normal")
             self.schedule_refresh()
 
         self.run_async(
-            lambda: self.engine.force_all_streams(target, respect_pins=True),
+            lambda: self.engine.follow_jack(plugged),
             on_done=done,
-            on_error=lambda exc: self.flash(f"Routing to {target} failed: {exc}", 4000),
+            on_error=lambda exc: self.flash(f"{title}: routing failed: {exc}", 4000),
         )
-
-    def _on_plug_dialog_finished(self, msg: QMessageBox) -> None:
-        if self._plug_dialog is msg:
-            self._plug_dialog = None
-        msg.deleteLater()
-
-    def _close_plug_dialog(self) -> None:
-        msg, self._plug_dialog = self._plug_dialog, None
-        if msg is not None:
-            msg.close()
-            msg.deleteLater()
-
-    def sync_pin_buttons(self) -> None:
-        for row in self.stream_rows.values():
-            row.refresh_pin_state()
-        self.update_status()
-
-    def unpin_all_streams(self) -> None:
-        self.engine.clear_all_pins()
-        self.sync_pin_buttons()
-        self.flash("Persistent pins cleared: automatic jack switching active", 2500)
 
     def on_manual_fix(self) -> None:
         self.fix_btn.setEnabled(False)
@@ -1048,13 +913,11 @@ class AppWindow(QMainWindow):
 
     def _collect_snapshot(self) -> Dict[str, Any]:
         """Runs on a worker thread: all subprocess work happens here."""
+        sinks_ok = bool(self.engine.recover_missing_sinks())
         sink_info = self.engine.get_sink_info()
         streams = self.engine.get_streams()
         external = self.engine.get_external_sinks()
-        applied = self.engine.apply_pins(streams)
-        if isinstance(applied, list):
-            streams = applied
-        return {"sinks": sink_info, "streams": streams, "external": external}
+        return {"sinks": sink_info, "streams": streams, "external": external, "sinks_ok": sinks_ok}
 
     def _on_snapshot(self, snap: Dict[str, Any]) -> None:
         try:
@@ -1063,6 +926,10 @@ class AppWindow(QMainWindow):
             self._refresh_finished()
 
     def _apply_snapshot(self, snap: Dict[str, Any]) -> None:
+        self._sinks_ok = snap["sinks_ok"]
+        if not self._sinks_ok and not self.engine.recovery_exhausted and not self._closing:
+            self._recovery_timer.start()  # sink loss may produce no further PipeWire events
+
         sink_info = snap["sinks"]
         self.master_hp.update_state(sink_info.get("Headphones"))
         self.master_spk.update_state(sink_info.get("Speakers"))
@@ -1087,6 +954,12 @@ class AppWindow(QMainWindow):
                 self.rows_layout.addWidget(row)
                 self.stream_rows[sid] = row
 
+        self._available_sinks = set(INTERNAL_SINK_NAMES.values()) & set(sink_info)
+        for row in self.stream_rows.values():
+            row.set_available_sinks(self._available_sinks)
+        for target, action in self.tray_force_actions.items():
+            action.setEnabled(target in self._available_sinks)
+
         self._external_count = len(snap["external"])
         self.filter_streams()
         self.update_status()
@@ -1101,14 +974,13 @@ class AppWindow(QMainWindow):
         if self._closing or time.monotonic() < self._flash_until:
             return
         active_cnt = len(self.stream_rows)
-        pinned_cnt = sum(1 for r in self.stream_rows.values() if r.btn_pin.isChecked())
         ext_cnt = self._external_count
         ext_txt = f" • {ext_cnt} external USB/BT" if ext_cnt else ""
         warn_txt = "" if self._sinks_ok else "Virtual sinks unavailable (try Repair) • "
 
         if active_cnt:
             plural = "s" if active_cnt > 1 else ""
-            self.status.showMessage(f"{warn_txt}{active_cnt} active stream{plural} • {pinned_cnt} pinned{ext_txt}")
+            self.status.showMessage(f"{warn_txt}{active_cnt} active stream{plural}{ext_txt}")
         else:
             self.status.showMessage(f"{warn_txt}No audio playing{ext_txt}")
 
@@ -1127,8 +999,8 @@ class AppWindow(QMainWindow):
             return
         self._closing = True
         self._refresh_timer.stop()
+        self._recovery_timer.stop()
         self._slow_timer.stop()
-        self._close_plug_dialog()
         if self.pulse_monitor is not None:
             self.pulse_monitor.stop()
         if self.jack_monitor is not None:

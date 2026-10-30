@@ -64,7 +64,7 @@ rm -rf "$APP_SHARE"
 rm -f "$BIN_TARGET" "$DESKTOP_FILE" "$PW_DROPIN_FILE"
 
 REMOVE_CONFIG=0
-echo "==> Do you want to remove configuration and pinned apps as well? ($CONFIG_DIR)"
+echo "==> Do you want to remove the configuration as well? ($CONFIG_DIR)"
 if [ -t 0 ]; then
     REPLY=""
     read -r -p "Remove config files? [y/N] " -n 1 REPLY || true

@@ -31,11 +31,11 @@ Two independent parts:
 │          hda-audio-control (Python)        │
 │  - jack state, Auto-Mute handling          │
 │  - stream discovery (pactl subscribe)      │
-│  - per-stream routing and pins             │
+│  - per-stream routing                      │
 └───────┬──────────────────────────┬─────────┘
         │ pactl move-sink-input    │
         ▼                          ▼
-[ PipeWire drop-in sinks ]   [ pinned_apps.json ]
+[ PipeWire drop-in sinks ]
  ├── Headphones (AUX0/1)
  ├── Speakers   (AUX2/3)
  └── Both       (combine-stream)
@@ -46,10 +46,9 @@ Two independent parts:
 ## Features
 
 * **Wizard**: scans `/proc/asound`, picks the analog HDA codec (ignoring GPU HDMI), switches it to `pro-audio`, checks that `AUX0`-`AUX3` all exist, then plays a soft test tone on each pair and asks which output you heard. It saves the mapping only if the answers are consistent.
-* **Per-stream routing**: each PipeWire playback stream gets its own row. Clicking *Headphones*, *Speakers* or *Both* moves that stream immediately; it does **not** pin it.
-* **Pins (📌)**: pinning remembers the output for an application (not a single stream or browser tab) in `~/.config/pipewire-split/pinned_apps.json`. Pinned applications are routed to their saved output whenever their streams appear.
+* **Per-stream routing**: each PipeWire playback stream gets its own row. Clicking *Headphones*, *Speakers* or *Both* moves that stream immediately, and it stays there until it closes. The choice is not saved: when an app closes or recreates its stream, the stream starts over.
 * **Browser tabs**: routing is per PipeWire stream. Some browsers expose one stream per playing tab, others share one stream between tabs, so per-tab control depends on the browser. Tab titles come from MPRIS (`playerctl` or D-Bus) when available.
-* **Jack handling**: on unplug, non-pinned streams move to Speakers; on plug, you are asked where to route audio. Pinned apps are left alone by jack events.
+* **Jack handling**: audio follows the jack. Plugging in moves streams to Headphones and unplugging moves them to Speakers. Streams you moved by hand stay where you put them; the exception is a stream on Headphones when you unplug, which plays on Speakers until you plug back in.
 * **Tray and CLI**: tray icon with jack status, and CLI flags for window-manager keybindings (`--force-hp`, `--force-spk`, `--force-both`, `--toggle-mute`). Launching a second instance raises the existing window.
 
 ---
@@ -116,13 +115,17 @@ hda-audio-control --force-both   # route all active streams to Both
 hda-audio-control --toggle-mute  # toggle mute on the internal outputs
 ```
 
-**Pins vs. Force:** *Force All* (tray and CLI flags) is an explicit command and overrides pins. Jack events respect pins.
+**Force All** (tray and CLI flags) is an explicit command: it moves every stream and replaces the choices made by hand.
 
 **Both** mirrors a stream to the headphones and speakers through the `Both` combine sink.
 
 ### Volume
 
-The app never raises ALSA hardware levels and its sliders stop at 100%. Because `pro-audio` routing bypasses the codec's normal mixer, the hardware gain may already be high: **start with the volume low when using headphones**.
+While the app runs it keeps the card on `pro-audio`: if the profile changes, it switches back and restarts PipeWire. To use another profile, quit the app first.
+
+Audio moves to the headphones as soon as you plug them in, at the level of the **Headphones** slider, so keep that slider at a comfortable level.
+
+Sliders stop at 100%. The app leaves ALSA hardware levels alone with one exception: switching away from an analog profile can leave `Master`, `Headphone` or `Speaker` at exactly 0%, which silences `pro-audio`. Only in that case it first lowers the **Hardware** slider to at most 40%, then sets those controls to 0 dB. Because `pro-audio` routing bypasses the codec's normal mixer, the hardware gain may already be high: **start with the volume low when using headphones**.
 
 If everything reads 100% but sounds quiet, check the **Hardware** slider. It is the `pro-audio` output feeding both sinks, and WirePlumber may start it at 40% (about -24 dB). The app never raises it by itself. Lower the Headphones and Speakers sliders before raising it, because it can make the sound much louder.
 
@@ -143,7 +146,7 @@ python3 -m unittest discover -s tests -v            # unit tests
 ./uninstall.sh
 ```
 
-It stops running instances, removes the app, launcher and PipeWire drop-in, restarts PipeWire and, when recorded in the config, restores the card's original profile and Auto-Mute value. Configs written by older versions have no recorded values; in that case it tries a standard analog profile and prints the manual `amixer` command. Volumes are not changed. Your configuration and pins are kept unless you answer `y` (or when there is no terminal).
+It stops running instances, removes the app, launcher and PipeWire drop-in, restarts PipeWire and, when recorded in the config, restores the card's original profile and Auto-Mute value. Configs written by older versions have no recorded values; in that case it tries a standard analog profile and prints the manual `amixer` command. Volumes are not changed. Your configuration is kept unless you answer `y` (or when there is no terminal).
 
 ---
 
@@ -153,7 +156,7 @@ It stops running instances, removes the app, launcher and PipeWire drop-in, rest
 hda-pipewire-split/
 ├── hda_split/
 │   ├── config.py       # discovery, config file, PipeWire drop-in generator
-│   ├── engine.py       # ALSA/PipeWire commands, routing, pins
+│   ├── engine.py       # ALSA/PipeWire commands, routing
 │   ├── monitor.py      # jack and PulseAudio event threads
 │   ├── mpris.py        # media title lookup (playerctl / D-Bus)
 │   └── gui.py          # PyQt6 window and tray

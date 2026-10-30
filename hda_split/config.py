@@ -1,9 +1,9 @@
-import json
 import logging
 import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,7 +12,6 @@ log = logging.getLogger("hda_split")
 # --- Paths & Constants ---
 CONFIG_DIR = Path.home() / ".config" / "pipewire-split"
 CONFIG_FILE = CONFIG_DIR / "config.env"
-PINS_FILE = CONFIG_DIR / "pinned_apps.json"
 
 PW_CONF_DIR = Path.home() / ".config" / "pipewire" / "pipewire.conf.d"
 PW_DROPIN_FILE = PW_CONF_DIR / "99-hda-split.conf"
@@ -34,6 +33,10 @@ DEFAULT_CONFIG: Dict[str, str] = {
 
 # --- Shell & String Utilities ---
 CMD_TIMEOUT = 5.0
+LEVEL_CONTROLS = ("Master", "Headphone", "Speaker")
+SAFE_NODE_VOLUME = 40  # percent; WirePlumber's own default for a new output
+NODE_WAIT_STEPS = 8
+NODE_WAIT_STEP_SEC = 0.25
 _PCI_RE = re.compile(r"pci-([0-9a-fA-F]{4}_[0-9a-fA-F]{2}_[0-9a-fA-F]{2}\.[0-9a-fA-F])")
 _last_failure: Dict[str, str] = {}
 
@@ -115,6 +118,64 @@ def send_notification(title: str, message: str, urgency: str = "normal") -> None
         )
     except Exception as e:
         log.warning("Notification error: %s", e)
+
+
+# --- Hardware Levels ---
+def _control_is_at_zero(card_id: str, control: str) -> bool:
+    levels = re.findall(r"Playback \d+ \[(\d+)%\]", run_cmd(["amixer", "-c", card_id, "sget", control]))
+    return bool(levels) and all(level == "0" for level in levels)
+
+
+def _cap_node_volume(node_target: str) -> bool:
+    """Brings the pro-audio node down to SAFE_NODE_VOLUME if needed. False if its level can't be confirmed."""
+    output = ""
+    for _ in range(NODE_WAIT_STEPS):
+        output = run_cmd(["pactl", "get-sink-volume", node_target])
+        if output:
+            break
+        time.sleep(NODE_WAIT_STEP_SEC)  # the node appears shortly after a profile switch
+
+    levels = [int(level) for level in re.findall(r"(\d+)%", output)]
+    if not levels:
+        return False
+    if max(levels) <= SAFE_NODE_VOLUME:
+        return True
+    try:
+        proc = subprocess.run(
+            ["pactl", "set-sink-volume", node_target, f"{SAFE_NODE_VOLUME}%"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=command_env(),
+            timeout=CMD_TIMEOUT,
+        )
+    except Exception as e:
+        log.warning("Could not cap %s: %s", node_target, e)
+        return False
+    return proc.returncode == 0
+
+
+def restore_silenced_levels(card_id: str, node_target: str) -> None:
+    """
+    Leaving an analog profile can leave these controls at 0%, which silences pro-audio.
+    Only a control at exactly 0% is raised, to unity gain, and only after capping the node for hearing safety.
+    """
+    silenced = [c for c in LEVEL_CONTROLS if _control_is_at_zero(card_id, c)]
+    if not silenced:
+        return
+    if not _cap_node_volume(node_target):
+        log.warning("Leaving %s at 0%%: could not confirm a safe level on %s", ", ".join(silenced), node_target)
+        return
+    for control in silenced:
+        try:
+            subprocess.run(
+                ["amixer", "-c", card_id, "set", control, "0dB"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=command_env(),
+                timeout=CMD_TIMEOUT,
+            )
+        except Exception as e:
+            log.warning("Could not restore %s: %s", control, e)
 
 
 # --- Hardware Discovery ---
@@ -352,20 +413,3 @@ def save_config(cfg_dict: Dict[str, str]) -> None:
         lines.append(f'{k}="{v}"')
     atomic_write_text(CONFIG_FILE, "\n".join(lines) + "\n")
     write_pipewire_dropin(cfg_dict)
-
-
-def load_pinned_apps() -> Dict[str, str]:
-    """Loads persistent per-application rules { 'app_key': 'Headphones' | 'Speakers' | 'Both' }."""
-    if PINS_FILE.exists():
-        try:
-            data = json.loads(PINS_FILE.read_text())
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-    return {}
-
-
-def save_pinned_apps(pins_dict: Dict[str, str]) -> None:
-    """Saves persistent per-application routing rules to disk."""
-    atomic_write_text(PINS_FILE, json.dumps(pins_dict, indent=2) + "\n")

@@ -77,6 +77,60 @@ class HardwareReadyTests(HermeticTestCase):
             [["pactl", "set-card-profile", "alsa_card.pci-0000_65_00.6", "pro-audio"]],
         )
 
+    def _stub_levels(self, master="100", headphone="0", speaker="0", node_volume="100%"):
+        for ctrl, level in (("Master", master), ("Headphone", headphone), ("Speaker", speaker)):
+            self.sp.stub(
+                ["amixer", "-c", CARD, "sget", ctrl],
+                stdout=f"  Limits: Playback 0 - 87\n  Front Left: Playback 1 [{level}%] [-1.00dB] [on]\n",
+            )
+        self.sp.stub(["pactl", "get-sink-volume", TARGET], stdout=f"Volume: aux0: 1 / {node_volume} / 0 dB\n")
+
+    def test_levels_zeroed_by_a_profile_switch_are_restored_after_capping_the_node(self):
+        # Leaving an analog profile leaves Headphone/Speaker at 0%: pro-audio would be silent
+        engine = self.make_engine()
+        self._stub_levels()
+        self.sp.reset()
+        engine.ensure_hardware_ready()
+
+        cap = ["pactl", "set-sink-volume", TARGET, "40%"]
+        argvs = self.sp.argvs()
+        self.assertIn(cap, argvs)
+        raises = [a for a in argvs if a[:3] == ["amixer", "-c", CARD] and a[-1] == "0dB"]
+        self.assertEqual([a[4] for a in raises], ["Headphone", "Speaker"])
+        self.assertLess(argvs.index(cap), argvs.index(raises[0]), "the node must be capped before raising")
+
+    def test_levels_above_zero_are_never_changed(self):
+        engine = self.make_engine()
+        self._stub_levels(master="30", headphone="1", speaker="55")
+        self.sp.reset()
+        engine.ensure_hardware_ready()
+        self.assertEqual([a for a in self.sp.argvs() if a[-1] == "0dB"], [])
+        self.assertEqual(self.sp.find("pactl", "set-sink-volume"), [])
+
+    def test_a_quieter_node_is_not_raised_to_the_cap(self):
+        engine = self.make_engine()
+        self._stub_levels(node_volume="25%")
+        self.sp.reset()
+        engine.ensure_hardware_ready()
+        self.assertEqual(self.sp.find("pactl", "set-sink-volume"), [])
+        self.assertTrue([a for a in self.sp.argvs() if a[-1] == "0dB"])
+
+    def test_levels_stay_at_zero_when_the_node_cannot_be_capped(self):
+        # Hearing safety: never raise the hardware without knowing the software level
+        engine = self.make_engine()
+        self._stub_levels()
+        self.sp.stub(["pactl", "get-sink-volume", TARGET], stdout="")
+        self.sp.reset()
+        with mock.patch.object(cfg_mod.time, "sleep"):
+            engine.ensure_hardware_ready()
+        self.assertEqual([a for a in self.sp.argvs() if a[-1] == "0dB"], [])
+
+        self._stub_levels()
+        self.sp.stub(["pactl", "set-sink-volume", TARGET, "40%"], rc=1, stderr="no")
+        self.sp.reset()
+        engine.ensure_hardware_ready()
+        self.assertEqual([a for a in self.sp.argvs() if a[-1] == "0dB"], [])
+
     def test_ensure_hardware_ready_falls_back_to_auto_mute_off(self):
         engine = self.make_engine()
         self.sp.stub(["amixer", "-c", CARD, "set", "Auto-Mute Mode", "Disabled"], rc=1, stderr="no")
@@ -91,7 +145,7 @@ class HardwareReadyTests(HermeticTestCase):
         self.sp.stub(["pactl", "list", "sinks", "short"], stdout=sinks_short(["Headphones", "Speakers", "Both"], 40))
         engine = self.make_engine()
         engine.force_all_streams("Headphones")
-        engine.force_all_streams("Both", respect_pins=True)
+        engine.force_all_streams("Both")
         engine.route_stream("7", "Speakers")
         self.assertTrue(self.sp.calls)
         for argv in self.sp.argvs():
@@ -116,55 +170,89 @@ class HardwareReadyTests(HermeticTestCase):
         self.assertEqual(unmuted, {"Master", "Headphone", "Speaker", "Bass Speaker"})
 
 
-class ForceAllStreamsTests(HermeticTestCase):
+class RoutingRuleTests(HermeticTestCase):
     def setUp(self):
         super().setUp()
         self.sp.allow_audio_mutations()
         props = lambda app, binary, pid: {  # noqa: E731
             "application.name": app, "application.process.binary": binary, "application.process.id": pid}
         self.sp.stub(["pactl", "list", "sink-inputs"], stdout=(
-            sink_input(11, "41", props("Spotify", "spotify", "1"))      # pinned, on Speakers
-            + sink_input(12, "41", props("Firefox", "firefox", "2"))    # unpinned, on Speakers
-            + sink_input(13, "40", props("Firefox", "firefox", "2"))    # unpinned, already on Headphones
+            sink_input(11, "41", props("Spotify", "spotify", "1"))      # on Speakers
+            + sink_input(12, "41", props("Chrome", "chrome", "2"))      # on Speakers
+            + sink_input(13, "40", props("Chrome", "chrome", "2"))      # already on Headphones
         ))
         self.sp.stub(["pactl", "list", "sinks", "short"], stdout=sinks_short(["Headphones", "Speakers", "Both"], 40))
         self.engine = self.make_engine()
-        self.engine.pinned_apps = {"spotify": "Speakers"}
         self.sp.reset()
 
     def moves(self):
         return [a[2:] for a in self.sp.find("pactl", "move-sink-input")]
 
-    def test_force_all_streams_respect_pins_skips_pinned_and_counts_only_moved(self):
-        moved = self.engine.force_all_streams("Headphones", respect_pins=True)
-        self.assertEqual(moved, 1)
-        self.assertEqual(self.moves(), [["12", "Headphones"]])
-
-    def test_force_all_streams_without_pin_respect_moves_pinned_apps_too(self):
-        moved = self.engine.force_all_streams("Headphones")
-        self.assertEqual(moved, 2)
+    def test_plugging_moves_untouched_streams_to_headphones_and_counts_only_moved(self):
+        self.assertEqual(self.engine.follow_jack(True), 2)
         self.assertEqual(sorted(self.moves()), [["11", "Headphones"], ["12", "Headphones"]])
 
-    def test_force_all_streams_sets_default_sink_before_moving_streams(self):
-        self.engine.force_all_streams("Headphones", respect_pins=True)
-        argvs = self.sp.argvs()
-        default_idx = argvs.index(["pactl", "set-default-sink", "Headphones"])
-        move_idx = argvs.index(["pactl", "move-sink-input", "12", "Headphones"])
-        self.assertLess(default_idx, move_idx)
+    def test_unplugging_moves_untouched_streams_to_speakers(self):
+        self.assertEqual(self.engine.follow_jack(False), 1)
+        self.assertEqual(self.moves(), [["13", "Speakers"]])
 
-    def test_force_all_streams_does_not_count_failed_moves(self):
+    def test_a_tab_moved_by_hand_stays_while_its_sibling_follows_the_jack(self):
+        # Two tabs of one browser: same app, different streams. Choosing for one must not affect the other
+        self.assertTrue(self.engine.choose_output("12", "Speakers"))
+        self.sp.reset()
+        self.engine.follow_jack(True)
+        self.assertEqual(self.moves(), [["11", "Headphones"]])
+
+    def test_a_stream_chosen_for_headphones_is_not_left_silent_and_returns_on_replug(self):
+        self.assertTrue(self.engine.choose_output("13", "Headphones"))
+        self.sp.reset()
+        self.engine.follow_jack(False)
+        self.assertIn(["13", "Speakers"], self.moves())
+
+        self.sp.stub(["pactl", "list", "sink-inputs"], stdout=sink_input(
+            13, "41", {"application.name": "Chrome", "application.process.binary": "chrome",
+                       "application.process.id": "2"}))
+        self.sp.reset()
+        self.engine.follow_jack(True)
+        self.assertEqual(self.moves(), [["13", "Headphones"]])
+
+    def test_a_stream_chosen_for_both_stays_on_both_across_the_jack(self):
+        self.assertTrue(self.engine.choose_output("12", "Both"))
+        self.sp.reset()
+        self.engine.follow_jack(False)
+        self.engine.follow_jack(True)
+        self.assertNotIn("12", [m[0] for m in self.moves() if m[1] != "Both"])
+
+    def test_a_failed_move_is_not_remembered_as_a_choice(self):
         self.sp.stub(["pactl", "move-sink-input", "12"], rc=1, stderr="No such entity")
-        self.assertEqual(self.engine.force_all_streams("Headphones", respect_pins=True), 0)
+        self.assertFalse(self.engine.choose_output("12", "Speakers"))
+        self.assertEqual(self.engine.manual_routes, {})
 
-    def test_apply_pins_moves_only_streams_not_already_on_pinned_sink(self):
-        streams = [
-            {"id": "1", "app_key": "spotify", "sink_name": "Headphones"},
-            {"id": "2", "app_key": "spotify", "sink_name": "Speakers"},
-            {"id": "3", "app_key": "other", "sink_name": "Headphones"},
-        ]
-        self.engine.apply_pins(streams)
-        self.assertEqual(self.moves(), [["1", "Speakers"]])
-        self.assertEqual(streams[0]["sink_name"], "Speakers")
+    def test_the_choice_is_forgotten_when_the_stream_closes(self):
+        self.engine.choose_output("12", "Speakers")
+        self.engine.choose_output("99", "Both")
+        self.engine.get_streams()
+        self.assertEqual(self.engine.manual_routes, {"12": "Speakers"})
+
+    def test_force_all_moves_everything_and_replaces_choices(self):
+        self.engine.choose_output("12", "Both")
+        self.sp.reset()
+        self.assertEqual(self.engine.force_all_streams("Headphones"), 2)
+        self.assertEqual(sorted(self.moves()), [["11", "Headphones"], ["12", "Headphones"]])
+        self.assertEqual(self.engine.manual_routes, {})
+
+    def test_default_sink_is_set_before_moving_streams(self):
+        self.engine.follow_jack(True)
+        argvs = self.sp.argvs()
+        self.assertLess(
+            argvs.index(["pactl", "set-default-sink", "Headphones"]),
+            argvs.index(["pactl", "move-sink-input", "12", "Headphones"]),
+        )
+
+    def test_failed_moves_are_not_counted(self):
+        self.sp.stub(["pactl", "move-sink-input", "12"], rc=1, stderr="No such entity")
+        self.assertEqual(self.engine.follow_jack(True), 1)
+        self.assertEqual(self.engine.force_all_streams("Headphones"), 1)
 
 
 class EnsureSinksTests(HermeticTestCase):
@@ -215,12 +303,35 @@ class EnsureSinksTests(HermeticTestCase):
         profile_idx = argvs.index(["pactl", "set-card-profile", "alsa_card.pci-0000_65_00.6", "pro-audio"])
         self.assertGreater(profile_idx, restart_idx)
 
+    def test_profile_is_requested_only_after_the_card_is_listed_again(self):
+        # Right after a restart `set-card-profile` fails with "No such entity", leaving the card on analog
+        engine = self.make_engine()
+        self.sp.stub(["pactl", "info"], stdout="Server String: x")
+        self.sp.stub(["pactl", "list", "sinks", "short"], stdout=sinks_short(["Headphones", "Speakers", "Both", engine.target_node]))
+        listings = []
+
+        def cards(argv):
+            listings.append(argv)
+            return f"7\t{engine.card_name}\talsa" if len(listings) >= 3 else ""
+
+        self.sp.stub(["pactl", "list", "cards", "short"], stdout=cards)
+        self.sp.reset()
+        engine.ensure_sinks_exist(force_reload=True)
+
+        argvs = self.sp.argvs()
+        restart = argvs.index(["systemctl", "--user", "restart", "pipewire"])
+        profile = argvs.index(["pactl", "set-card-profile", engine.card_name, "pro-audio"])
+        card_polls = [i for i, a in enumerate(argvs) if a[:4] == ["pactl", "list", "cards", "short"]]
+        self.assertEqual(len(card_polls), 3)
+        self.assertLess(restart, card_polls[0])
+        self.assertLess(card_polls[-1], profile)
+
     def test_ensure_sinks_exist_reports_failure_when_sinks_never_appear(self):
         engine = self.make_engine()
         self.sp.stub(["pactl", "info"], stdout="Server String: x")
         self.sp.stub(["pactl", "list", "sinks", "short"], stdout=sinks_short(["alsa_output.x"]))
         self.assertFalse(engine.ensure_sinks_exist())
-        self.assertLess(sum(self.clock.sleeps), 6.0, "polling must be bounded (about 5 s)")
+        self.assertLess(sum(self.clock.sleeps), 8.0, "polling must be bounded (5 s for the sinks, 2 s for the node)")
 
     def test_both_sink_is_kept_at_unity_so_it_matches_a_single_output(self):
         # WirePlumber can start the sink at 40%: Both then sounds ~24 dB quieter than Headphones or Speakers
@@ -250,6 +361,78 @@ class EnsureSinksTests(HermeticTestCase):
         engine.force_all_streams("Both")
         volumes = [c.argv if hasattr(c, "argv") else c for c in self.sp.find("pactl", "set-sink-volume")]
         self.assertEqual(volumes, [["pactl", "set-sink-volume", "Both", "100%"]])
+
+    def _recovery_engine(self, sinks):
+        engine = self.make_engine()
+        self.sp.stub(["pactl", "info"], stdout="Server String: x")
+        self.sp.stub(["pactl", "list", "sinks", "short"], stdout=sinks_short(sinks))
+        self.sp.reset()
+        # These tests freeze time.monotonic, which would keep the real polling loop waiting forever
+        patcher = mock.patch.object(engine, "_wait_for_sinks", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return engine
+
+    def test_missing_sinks_are_recreated_after_a_grace_period(self):
+        # A card profile switch destroys the loopbacks and nothing brings them back
+        engine = self._recovery_engine(["Both"])
+        with mock.patch.object(eng_mod.time, "monotonic", return_value=1000.0), mock.patch.object(eng_mod.time, "sleep"):
+            self.assertFalse(engine.recover_missing_sinks())
+        self.assertEqual(self.sp.find("systemctl"), [], "a restart in progress must get time to finish")
+        with mock.patch.object(eng_mod.time, "monotonic", return_value=1004.0), mock.patch.object(eng_mod.time, "sleep"):
+            engine.recover_missing_sinks()
+        self.assertEqual(len(self.sp.find("systemctl")), 1)
+
+    def test_sink_recovery_stops_after_the_attempt_limit(self):
+        engine = self._recovery_engine(["Both"])
+        now = 1000.0
+        with mock.patch.object(eng_mod.time, "sleep"):
+            for _ in range(12):
+                with mock.patch.object(eng_mod.time, "monotonic", return_value=now):
+                    engine.recover_missing_sinks()
+                now += 40.0
+        self.assertEqual(len(self.sp.find("systemctl")), AudioEngine.RECOVERY_MAX_ATTEMPTS)
+        self.assertTrue(engine.recovery_exhausted)
+
+    def test_sink_recovery_respects_the_restart_cooldown_and_resets_when_sinks_return(self):
+        engine = self._recovery_engine(["Both"])
+        with mock.patch.object(eng_mod.time, "sleep"):
+            with mock.patch.object(eng_mod.time, "monotonic", return_value=1000.0):
+                engine.recover_missing_sinks()
+            engine._last_restart = 1002.0
+            with mock.patch.object(eng_mod.time, "monotonic", return_value=1010.0):
+                self.assertFalse(engine.recover_missing_sinks())
+            self.assertEqual(self.sp.find("systemctl"), [])
+
+            self.sp.stub(
+                ["pactl", "list", "sinks", "short"],
+                stdout=sinks_short(["Headphones", "Speakers", "Both", engine.target_node]),
+            )
+            self.assertTrue(engine.recover_missing_sinks())
+        self.assertIsNone(engine._sinks_missing_since)
+        self.assertEqual(engine._recovery_attempts, 0)
+
+    def test_sinks_without_the_hardware_node_count_as_broken_and_pro_audio_returns_before_the_restart(self):
+        # On an analog profile the loopback sinks can come back with nothing behind them: silent but "present"
+        engine = self._recovery_engine(["Headphones", "Speakers", "Both", "alsa_output.x.analog-stereo"])
+        with mock.patch.object(eng_mod.time, "monotonic", return_value=1000.0):
+            self.assertFalse(engine.recover_missing_sinks())
+        with mock.patch.object(eng_mod.time, "monotonic", return_value=1004.0):
+            engine.recover_missing_sinks()
+        argvs = self.sp.argvs()
+        profile = ["pactl", "set-card-profile", engine.card_name, "pro-audio"]
+        restart = ["systemctl", "--user", "restart", "pipewire"]
+        self.assertLess(argvs.index(profile), argvs.index(restart))
+
+    def test_sink_recovery_does_nothing_when_pactl_is_unreachable(self):
+        engine = self._recovery_engine([])
+        self.sp.stub(["pactl", "info"], stdout="")
+        with mock.patch.object(eng_mod.time, "monotonic", return_value=1000.0):
+            self.assertFalse(engine.recover_missing_sinks())
+        with mock.patch.object(eng_mod.time, "monotonic", return_value=1100.0):
+            self.assertFalse(engine.recover_missing_sinks())
+        self.assertEqual(self.sp.find("systemctl"), [])
+        self.assertEqual(engine._recovery_attempts, 0)
 
     def test_internal_sinks_present_compares_exact_names(self):
         engine = self.make_engine()
@@ -435,7 +618,7 @@ class GetStreamsTests(HermeticTestCase):
         streams = self.streams_for(blocks)
         self.assertEqual([s["id"] for s in streams], ["2"])
         s = streams[0]
-        self.assertEqual((s["sink_name"], s["volume"], s["muted"], s["app_key"]), ("Speakers", 35, True, "mpv"))
+        self.assertEqual((s["sink_name"], s["volume"], s["muted"]), ("Speakers", 35, True))
 
     def test_get_streams_returns_empty_list_when_pactl_is_silent(self):
         self.assertEqual(self.streams_for([]), [])
@@ -516,25 +699,6 @@ class MprisMatchingTests(HermeticTestCase):
 
         self.sp.stub(["playerctl"], stdout="firefox: Part 1: Intro\nvlc: ")
         self.assertEqual(mpris_mod.get_mpris_tab_titles(), {"firefox": "Part 1: Intro"})
-
-
-class AppKeyTests(HermeticTestCase):
-    def test_get_app_key_uses_application_name_for_electron_apps(self):
-        self.assertEqual(AudioEngine.get_app_key({"app": "Discord", "binary": "electron"}), "discord")
-        self.assertEqual(AudioEngine.get_app_key({"app": "Slack", "binary": "electron33"}), "slack")
-
-    def test_get_app_key_uses_binary_for_normal_apps(self):
-        self.assertEqual(AudioEngine.get_app_key({"app": "Firefox", "binary": "firefox"}), "firefox")
-        self.assertEqual(AudioEngine.get_app_key({"app": "Firefox Developer", "binary": "firefox-developer-edition"}),
-                         "firefox-developer-edition")
-
-    def test_get_app_key_other_runtimes_and_missing_parts(self):
-        key = AudioEngine.get_app_key
-        self.assertEqual(key({"app": "Foo", "binary": "python3.12"}), "foo")
-        self.assertEqual(key({"app": "Foo", "binary": "wine64-preloader"}), "foo")
-        self.assertEqual(key({"app": "", "binary": "electron"}), "electron")
-        self.assertEqual(key({"app": "X", "binary": ""}), "x")
-        self.assertEqual(key({}), "")
 
 
 class VolumeTests(HermeticTestCase):
@@ -643,10 +807,9 @@ class ConfigTests(HermeticTestCase):
         self.assertEqual([p.name for p in self.base.iterdir() if p.name.startswith(".file")], [])
         self.assertEqual(sorted(p.name for p in self.base.iterdir() if p.is_file()), ["file.txt"])
 
-    def test_save_config_and_pins_leave_only_final_files(self):
+    def test_save_config_leaves_only_final_files(self):
         self.write_config()
-        cfg_mod.save_pinned_apps({"a": "Both"})
-        self.assertEqual(sorted(p.name for p in self.config_dir.iterdir()), ["config.env", "pinned_apps.json"])
+        self.assertEqual(sorted(p.name for p in self.config_dir.iterdir()), ["config.env"])
         self.assertEqual([p.name for p in self.pw_conf_dir.iterdir()], ["99-hda-split.conf"])
 
     def test_resolve_card_index_follows_pci_id_when_the_index_changed(self):
@@ -714,7 +877,7 @@ class ConfigTests(HermeticTestCase):
         self.assertEqual(call["kwargs"]["timeout"], cfg_mod.CMD_TIMEOUT)
 
     def test_temp_paths_are_isolated_from_the_real_home(self):
-        for p in (cfg_mod.CONFIG_DIR, cfg_mod.CONFIG_FILE, cfg_mod.PINS_FILE, cfg_mod.PW_CONF_DIR,
+        for p in (cfg_mod.CONFIG_DIR, cfg_mod.CONFIG_FILE, cfg_mod.PW_CONF_DIR,
                   cfg_mod.PW_DROPIN_FILE, eng_mod.PW_DROPIN_FILE):
             self.assertTrue(str(p).startswith(str(self.base)), p)
         self.assertTrue(os.environ["HOME"].startswith(tempfile.gettempdir()))

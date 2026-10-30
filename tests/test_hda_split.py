@@ -1,4 +1,4 @@
-"""Core behaviour tests (config, pins, engine parsing, MPRIS, jack monitor).
+"""Core behaviour tests (config, engine parsing, MPRIS, jack monitor).
 
 Run with:  python3 -m unittest discover -s tests -v
 Every test is hermetic: see tests/hermetic.py (no real pactl/amixer/pw-link/systemctl is ever executed).
@@ -97,13 +97,6 @@ class TestHdaSplitSuite(HermeticTestCase):
         self.assertIn("audio.position = [ AUX0 AUX1 ]", content)
         self.assertIn("audio.position = [ AUX2 AUX3 ]", content)
 
-    def test_2_persistent_app_pins_save_and_load(self):
-        """Verifies JSON saving and loading of per-application pins."""
-        cfg_mod.save_pinned_apps({"firefox": "Speakers", "discord": "Headphones"})
-        loaded = cfg_mod.load_pinned_apps()
-        self.assertEqual(loaded.get("firefox"), "Speakers")
-        self.assertEqual(loaded.get("discord"), "Headphones")
-
     def test_3_isolated_route_stream_no_global_pw_link(self):
         """Routing to 'Both' moves only the input to the Both sink, without any pw-link call."""
         engine = self.make_engine()
@@ -127,7 +120,6 @@ class TestHdaSplitSuite(HermeticTestCase):
         self.assertEqual(len(streams), 1)
         s = streams[0]
         self.assertEqual(s["id"], "112")
-        self.assertEqual(s["app_key"], "firefox")
         self.assertEqual(s["media_title"], "Lecture 04 - ML Security")
         self.assertEqual(s["sink_name"], "Headphones")
 
@@ -207,22 +199,6 @@ class TestHdaSplitSuite(HermeticTestCase):
         self.assertEqual(cfg["ALSA_CARD_ID"], cfg_mod.DEFAULT_CONFIG["ALSA_CARD_ID"])
         self.assertEqual(cfg["NODE_TARGET"], cfg_mod.DEFAULT_CONFIG["NODE_TARGET"])
         self.assertFalse(cfg_mod.CONFIG_FILE.exists(), "load_config must not create the file")
-
-    def test_9_engine_pin_management(self):
-        """Verifies pin and unpin operations within AudioEngine (persisted in the temp dir only)."""
-        engine = eng_mod.AudioEngine()
-        engine.pin_app("spotify", "Headphones")
-        self.assertEqual(engine.pinned_apps.get("spotify"), "Headphones")
-        self.assertEqual(cfg_mod.load_pinned_apps(), {"spotify": "Headphones"})
-
-        engine.unpin_app("spotify")
-        self.assertNotIn("spotify", engine.pinned_apps)
-
-        engine.pin_app("vlc", "Speakers")
-        engine.clear_all_pins()
-        self.assertEqual(len(engine.pinned_apps), 0)
-        self.assertEqual(cfg_mod.load_pinned_apps(), {})
-        self.assertTrue(str(cfg_mod.PINS_FILE).startswith(str(self.base)))
 
     def test_10_mpris_playerctl_title_resolution(self):
         """Verifies MPRIS browser tab and media title resolution via playerctl."""

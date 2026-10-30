@@ -18,6 +18,7 @@ from hda_split.config import (
     discover_hda_cards,
     load_config,
     port_channels,
+    restore_silenced_levels,
     run_cmd,
     save_config,
 )
@@ -259,7 +260,7 @@ def snapshot_original_state(selected: Dict[str, Any]) -> Dict[str, str]:
 
 def prepare_hardware_profile(card_id: str, card_name: str, default_target: str) -> Optional[str]:
     """
-    Switches the card to pro-audio, unmutes the ALSA switches (volumes are NOT changed) and
+    Switches the card to pro-audio, unmutes the ALSA switches, rescues levels stuck at 0% and
     resolves the PipeWire node name, restricted to this card's own pro-output nodes.
     Returns None if no node for this card shows up.
     """
@@ -282,14 +283,15 @@ def prepare_hardware_profile(card_id: str, card_name: str, default_target: str) 
             node_target = nodes[0]
             break
 
-    # Only unmute: no volume is set here. Hardware (ALSA) gain is left as it is.
-    for ctrl in ("Master", "Speaker", "Headphone"):
+    for ctrl in ("Master", "Speaker", "Headphone", "Bass Speaker"):
         subprocess.run(
             ["amixer", "-c", card_id, "set", ctrl, "unmute"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
     set_automute(card_id, "Disabled")
+    if node_target is not None:
+        restore_silenced_levels(card_id, node_target)
     return node_target
 
 

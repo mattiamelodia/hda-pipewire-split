@@ -11,7 +11,7 @@ HermeticTestCase then, for every test:
     read-only commands and raises HermeticViolation (a BaseException, so production `except Exception`
     cannot swallow it) for anything else that could change state and has not been stubbed,
   * makes subprocess.call / check_call / os.system / os.popen / os.fork unusable,
-  * redirects CONFIG_DIR / CONFIG_FILE / PINS_FILE / PW_CONF_DIR / PW_DROPIN_FILE in every loaded module
+  * redirects CONFIG_DIR / CONFIG_FILE / PW_CONF_DIR / PW_DROPIN_FILE in every loaded module
     that holds a copy of them,
   * patches shutil.which so every tool "exists" unless the test lists it in self.missing_cmds,
   * stubs discover_hda_cards (it reads the real /proc/asound) to return no cards.
@@ -26,6 +26,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from types import SimpleNamespace
 from unittest import mock
 
@@ -56,7 +57,7 @@ import hda_split.engine as eng_mod  # noqa: E402
 import main as main_mod  # noqa: E402
 import wizard as wizard_mod  # noqa: E402
 
-PATH_NAMES = ("CONFIG_DIR", "CONFIG_FILE", "PINS_FILE", "PW_CONF_DIR", "PW_DROPIN_FILE")
+PATH_NAMES = ("CONFIG_DIR", "CONFIG_FILE", "PW_CONF_DIR", "PW_DROPIN_FILE")
 
 
 class HermeticViolation(BaseException):
@@ -305,7 +306,6 @@ class HermeticTestCase(unittest.TestCase):
         values = {
             "CONFIG_DIR": self.config_dir,
             "CONFIG_FILE": self.config_dir / "config.env",
-            "PINS_FILE": self.config_dir / "pinned_apps.json",
             "PW_CONF_DIR": self.pw_conf_dir,
             "PW_DROPIN_FILE": self.pw_conf_dir / "99-hda-split.conf",
         }
@@ -411,7 +411,7 @@ def settle(app, ms=100):
 _APP = None
 
 
-def get_qapp():
+def get_qapp() -> Any:
     """One shared QApplication for the whole suite (Qt allows only one per process)."""
     global _APP
     from PyQt6.QtWidgets import QApplication

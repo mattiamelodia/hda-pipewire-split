@@ -335,8 +335,24 @@ class RunWizardTests(WizardBase):
                 self.assertIn(argv[-1], ("unmute", "Disabled"), joined)
         self.assertEqual(
             sorted(" ".join(a[4:]) for a in amixer if "set" in a),
-            ["Auto-Mute Mode Disabled", "Headphone unmute", "Master unmute", "Speaker unmute"],
+            ["Auto-Mute Mode Disabled", "Bass Speaker unmute", "Headphone unmute", "Master unmute", "Speaker unmute"],
         )
+
+    def test_wizard_restores_levels_zeroed_by_the_profile_switch_so_the_tone_is_audible(self):
+        # Coming from an analog profile, Headphone/Speaker are at 0%: the calibration tone would be inaudible
+        self.answers = self.happy_answers()
+        self.sp.allow(["pactl", "set-sink-volume"])
+        for ctrl in ("Headphone", "Speaker"):
+            self.sp.stub(["amixer", "-c", "2", "sget", ctrl], stdout="  Front Left: Playback 0 [0%] [-65.25dB] [on]\n")
+        self.sp.stub(["pactl", "get-sink-volume"], stdout="Volume: aux0: 1 / 100% / 0 dB\n")
+        self.run_wizard()
+        argvs = self.sp.argvs()
+        raises = [a for a in argvs if a[-1] == "0dB"]
+        self.assertEqual([a[4] for a in raises], ["Headphone", "Speaker"])
+        cap = [a for a in argvs if a[:2] == ["pactl", "set-sink-volume"] and a[-1] == "40%"]
+        self.assertTrue(cap)
+        self.assertLess(argvs.index(cap[0]), argvs.index(raises[0]))
+        self.assertLess(argvs.index(raises[-1]), argvs.index(self.sp.find("pw-play")[0]))
 
     def test_probe_is_aimed_at_the_node_not_a_port(self):
         self.answers = self.happy_answers()

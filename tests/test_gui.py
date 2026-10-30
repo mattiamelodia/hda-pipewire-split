@@ -8,23 +8,23 @@ import os
 import sys
 import threading
 import time
+from typing import Any
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hermetic  # noqa: E402,F401
 from hermetic import HermeticTestCase, get_qapp, settle, wait_until  # noqa: E402
 
-from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal  # noqa: E402
-from PyQt6.QtTest import QTest  # noqa: E402
-from PyQt6.QtWidgets import QMessageBox, QSystemTrayIcon  # noqa: E402
+from PyQt6.QtCore import QObject, pyqtSignal  # noqa: E402
+from PyQt6.QtWidgets import QMessageBox, QPushButton  # noqa: E402
 
 import hda_split.gui as gui  # noqa: E402
 
 MAIN_THREAD = threading.get_ident()
 
 
-def stream(sid, app, binary, key, sink, volume=50, pid="10", muted=False):
-    return {"id": sid, "app": app, "binary": binary, "app_key": key, "pid": pid, "volume": volume,
+def stream(sid, app, binary, sink, volume=50, pid="10", muted=False):
+    return {"id": sid, "app": app, "binary": binary, "pid": pid, "volume": volume,
             "muted": muted, "sink_name": sink, "media_title": "", "window_name": "", "media_name": ""}
 
 
@@ -34,16 +34,17 @@ class FakeEngine:
     def __init__(self):
         self.calls = []
         self.lock = threading.Lock()
-        self.pinned_apps = {}
         self.target_node = "alsa_output.fake.pro-output-0"
+        self.recovery_exhausted = False
+        self.missing_sinks = set()
         self.sinks_ok = True
         self.force_ret = 3
         self.snapshots = 0
         self.streams = [
-            stream("1", "Firefox", "firefox", "firefox", "Headphones", volume=120),
-            stream("2", "Firefox", "firefox", "firefox", "Speakers"),
-            stream("3", "BT Player", "btplayer", "btplayer", "bluez_output.xx", pid="11"),
-            stream("4", "Mystery", "", "", "Headphones", pid="12"),
+            stream("1", "Firefox", "firefox", "Headphones", volume=120),
+            stream("2", "Firefox", "firefox", "Speakers"),
+            stream("3", "BT Player", "btplayer", "bluez_output.xx", pid="11"),
+            stream("4", "Mystery", "", "Headphones", pid="12"),
         ]
 
     def _rec(self, name, *a, **kw):
@@ -77,13 +78,19 @@ class FakeEngine:
         self._rec("is_headphone_plugged")
         return True
 
+    def recover_missing_sinks(self):
+        self._rec("recover_missing_sinks")
+        return self.sinks_ok
+
     def get_sink_info(self):
         self._rec("get_sink_info")
-        return {
+        sinks = {
             "Headphones": {"volume": 130, "muted": False},
             "Speakers": {"volume": 40, "muted": True},
+            "Both": {"volume": 100, "muted": False},
             self.target_node: {"volume": 55, "muted": False},
         }
+        return {name: data for name, data in sinks.items() if name not in self.missing_sinks}
 
     def get_external_sinks(self):
         self._rec("get_external_sinks")
@@ -96,16 +103,22 @@ class FakeEngine:
         time.sleep(0.01)
         return [dict(s) for s in self.streams]
 
-    def apply_pins(self, streams):
-        self._rec("apply_pins")
 
     def route_stream(self, sid, target):
         self._rec("route_stream", sid, target)
         return True
 
-    def force_all_streams(self, target, respect_pins=False):
-        self._rec("force_all_streams", target, respect_pins=respect_pins)
+    def force_all_streams(self, target):
+        self._rec("force_all_streams", target)
         return self.force_ret
+
+    def follow_jack(self, plugged):
+        self._rec("follow_jack", plugged)
+        return self.force_ret
+
+    def choose_output(self, stream_id, target):
+        self._rec("choose_output", stream_id, target)
+        return True
 
     def set_sink_volume(self, name, vol):
         self._rec("set_sink_volume", name, vol)
@@ -119,17 +132,8 @@ class FakeEngine:
     def set_stream_mute(self, sid, muted):
         self._rec("set_stream_mute", sid, muted)
 
-    def pin_app(self, key, target):
-        self.pinned_apps[key] = target
-        self._rec("pin_app", key, target)
 
-    def unpin_app(self, key):
-        self.pinned_apps.pop(key, None)
-        self._rec("unpin_app", key)
 
-    def clear_all_pins(self):
-        self.pinned_apps.clear()
-        self._rec("clear_all_pins")
 
 
 class FakeJack(QObject):
@@ -183,8 +187,9 @@ class GuiBase(HermeticTestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def window(self, start_in_tray=False, wait_rows=True):
-        win = gui.AppWindow(start_in_tray=start_in_tray)
+    def window(self, start_in_tray=False, wait_rows=True) -> Any:
+        """Typed Any: the window holds the fakes patched in above, which static analysis cannot know."""
+        win: Any = gui.AppWindow(start_in_tray=start_in_tray)
         self.addCleanup(self._dispose, win)
         self.assertTrue(wait_until(self.app, lambda: win._started), "startup did not finish")
         if wait_rows:
@@ -209,7 +214,7 @@ class StartupTests(GuiBase):
         win = self.window()
         eng = win.engine
         self.assertTrue(all(c[3] != MAIN_THREAD for c in eng.calls), set(eng.names()))
-        self.assertTrue({"ensure_hardware_ready", "ensure_sinks_exist", "get_streams", "apply_pins"} <= set(eng.names()))
+        self.assertTrue({"ensure_hardware_ready", "ensure_sinks_exist", "get_streams", "recover_missing_sinks"} <= set(eng.names()))
         self.assertTrue(win.jack_monitor.started and win.pulse_monitor.started)
         self.assertEqual(win.tray_jack_action.text(), "Jack Connected")
 
@@ -237,6 +242,9 @@ class StartupTests(GuiBase):
         class Boom(FakeEngine):
             def ensure_sinks_exist(self, force_reload=False):
                 raise RuntimeError("pipewire exploded")
+
+            def recover_missing_sinks(self):
+                return False
 
         self.engine_cls = Boom
         win = self.window()
@@ -291,7 +299,7 @@ class SliderTests(GuiBase):
         row = win.stream_rows["1"]
         row.slider.setValue(30)
         self.assertTrue(row._vol_sender.busy())
-        row.update_data(stream("1", "Firefox", "firefox", "firefox", "Headphones", volume=77))
+        row.update_data(stream("1", "Firefox", "firefox", "Headphones", volume=77))
         self.assertEqual(row.slider.value(), 30)
 
     def test_master_volume_and_mute_go_through_the_worker_in_order(self):
@@ -327,58 +335,26 @@ class SliderTests(GuiBase):
         self.assertEqual(sent, [4])
 
 
-class PinAndRouteTests(GuiBase):
-    def test_route_click_does_not_pin_an_unpinned_app(self):
-        win = self.window()
-        eng = win.engine
-        eng.clear()
-        row = win.stream_rows["3"]
-        row.btn_hp.click()
-        self.assertTrue(wait_until(self.app, lambda: eng.find("route_stream")))
-        self.assertEqual(eng.find("route_stream")[0][1], ("3", "Headphones"))
-        self.assertEqual(eng.find("pin_app"), [])
-        self.assertEqual(eng.pinned_apps, {})
-        self.assertFalse(row.btn_pin.isChecked())
-
-    def test_route_click_moves_only_that_stream(self):
+class RouteTests(GuiBase):
+    def test_route_click_records_a_choice_for_that_stream_only(self):
         win = self.window()
         win.engine.clear()
         win.stream_rows["2"].btn_both.click()
-        self.assertTrue(wait_until(self.app, lambda: win.engine.find("route_stream")))
+        self.assertTrue(wait_until(self.app, lambda: win.engine.find("choose_output")))
         self.settle(50)
-        self.assertEqual([c[1] for c in win.engine.find("route_stream")], [("2", "Both")])
+        self.assertEqual([c[1] for c in win.engine.find("choose_output")], [("2", "Both")])
         self.assertEqual(win.engine.find("force_all_streams"), [])
+        self.assertNotEqual(win.engine.find("choose_output")[0][3], MAIN_THREAD)
 
-    def test_route_click_on_a_pinned_app_moves_the_pin_with_it(self):
+    def test_there_is_no_pin_control(self):
         win = self.window()
-        win.engine.pinned_apps["firefox"] = "Headphones"
-        win.sync_pin_buttons()
-        win.stream_rows["2"].btn_spk.click()
-        self.assertEqual(win.engine.pinned_apps["firefox"], "Speakers")
+        self.assertFalse(hasattr(win.stream_rows["1"], "btn_pin"))
+        self.assertNotIn("Reset Pins", [b.text() for b in win.findChildren(QPushButton)])
 
-    def test_pin_is_refused_on_an_external_sink(self):
+    def test_status_bar_does_not_mention_pins(self):
         win = self.window()
-        row = win.stream_rows["3"]
-        row.btn_pin.click()
-        self.assertNotIn("btplayer", win.engine.pinned_apps)
-        self.assertFalse(row.btn_pin.isChecked())
-        self.assertIn("Headphones, Speakers or Both", win.status.currentMessage())
-        self.assertEqual(win.engine.find("pin_app"), [])
-
-    def test_pin_uses_the_current_internal_sink_and_syncs_sibling_rows(self):
-        win = self.window()
-        win.stream_rows["1"].btn_pin.click()
-        self.assertEqual(win.engine.pinned_apps, {"firefox": "Headphones"})
-        self.assertTrue(win.stream_rows["2"].btn_pin.isChecked(), "same app, other stream")
-        win.stream_rows["1"].btn_pin.click()
-        self.assertEqual(win.engine.pinned_apps, {})
-        self.assertFalse(win.stream_rows["2"].btn_pin.isChecked())
-
-    def test_unidentified_app_cannot_be_pinned(self):
-        win = self.window()
-        row = win.stream_rows["4"]
-        self.assertFalse(row.btn_pin.isEnabled())
-        self.assertIn("Cannot pin", row.btn_pin.toolTip())
+        win.update_status()
+        self.assertNotIn("pinned", win.status.currentMessage())
 
     def test_external_sink_shows_no_selected_segment(self):
         win = self.window()
@@ -386,115 +362,52 @@ class PinAndRouteTests(GuiBase):
         self.assertFalse(any(b.isChecked() for b in (row.btn_hp, row.btn_spk, row.btn_both)))
         self.assertTrue(win.stream_rows["1"].btn_hp.isChecked())
 
-    def test_reset_pins_clears_everything(self):
+
+class JackPlugTests(GuiBase):
+    def test_plugging_follows_the_jack_without_asking(self):
         win = self.window()
-        win.engine.pinned_apps["firefox"] = "Both"
-        win.sync_pin_buttons()
-        self.assertTrue(win.stream_rows["1"].btn_pin.isChecked())
-        win.unpin_all_streams()
-        self.assertEqual(win.engine.pinned_apps, {})
-        self.assertFalse(win.stream_rows["1"].btn_pin.isChecked())
-
-
-class PlugDialogTests(GuiBase):
-    def plug(self, win):
+        win.engine.clear()
         win.jack_monitor.jack_state_changed.emit(True)
-        self.assertTrue(wait_until(self.app, lambda: len(self.dialogs()) >= 1))
-        return self.dialogs()[0]
-
-    def test_escape_on_the_plug_dialog_routes_nothing(self):
-        win = self.window()
-        dlg = self.plug(win)
-        self.assertEqual(dlg.escapeButton().text(), "Keep Current")
-        win.engine.clear()
-        QTest.keyClick(dlg, Qt.Key.Key_Escape)
-        self.assertTrue(wait_until(self.app, lambda: not self.dialogs()))
-        self.settle(100)
-        self.assertEqual(win.engine.find("force_all_streams"), [])
-        self.assertIsNone(win._plug_dialog)
-
-    def test_closing_the_plug_dialog_window_routes_nothing(self):
-        win = self.window()
-        dlg = self.plug(win)
-        win.engine.clear()
-        dlg.close()
-        self.settle(100)
-        self.assertEqual(win.engine.find("force_all_streams"), [])
+        self.assertTrue(wait_until(self.app, lambda: win.engine.find("follow_jack")))
+        call = win.engine.find("follow_jack")[0]
+        self.assertEqual(call[1], (True,))
+        self.assertNotEqual(call[3], MAIN_THREAD)
         self.assertEqual(self.dialogs(), [])
+        self.assertEqual(win.tray_jack_action.text(), "Jack Connected")
+        self.assertTrue(wait_until(self.app, lambda: self.notifications))
+        self.assertIn("3 stream(s)", self.notifications[-1][1])
 
-    def test_repeated_plug_events_do_not_stack_dialogs(self):
-        win = self.window()
-        for _ in range(3):
-            win.jack_monitor.jack_state_changed.emit(True)
-            self.settle(30)
-        self.assertEqual(len(self.dialogs()), 1)
-        self.assertEqual(self.dialogs()[0].windowModality(), Qt.WindowModality.NonModal)
-
-    def test_dialog_offers_the_four_choices(self):
-        win = self.window()
-        dlg = self.plug(win)
-        self.assertEqual({b.text() for b in dlg.buttons()},
-                         {"Headphones Only", "Speakers Only", "Both (Split)", "Keep Current"})
-
-    def test_choosing_a_destination_routes_with_pins_respected(self):
-        for label, target in (("Headphones Only", "Headphones"), ("Speakers Only", "Speakers"), ("Both (Split)", "Both")):
-            with self.subTest(label=label):
-                win = self.window()
-                dlg = self.plug(win)
-                win.engine.clear()
-                {b.text(): b for b in dlg.buttons()}[label].click()
-                self.assertTrue(wait_until(self.app, lambda: win.engine.find("force_all_streams")))
-                call = win.engine.find("force_all_streams")[0]
-                self.assertEqual((call[1], call[2]), ((target,), {"respect_pins": True}))
-                self.assertNotEqual(call[3], MAIN_THREAD)
-                self.assertTrue(wait_until(self.app, lambda: not self.dialogs()))
-                self.assertIsNone(win._plug_dialog)
-
-    def test_keep_current_routes_nothing(self):
-        win = self.window()
-        dlg = self.plug(win)
-        win.engine.clear()
-        {b.text(): b for b in dlg.buttons()}["Keep Current"].click()
-        self.settle(100)
-        self.assertEqual(win.engine.find("force_all_streams"), [])
-        self.assertIn("routing unchanged", win.status.currentMessage())
-
-    def test_unplugging_closes_an_open_dialog(self):
-        win = self.window()
-        self.plug(win)
-        win.jack_monitor.jack_state_changed.emit(False)
-        self.assertTrue(wait_until(self.app, lambda: not self.dialogs()))
-        self.assertIsNone(win._plug_dialog)
-
-    def test_plugging_re_applies_hardware_state_off_thread(self):
+    def test_replugging_applies_the_same_rule_every_time(self):
         win = self.window()
         win.engine.clear()
-        self.plug(win)
-        self.assertTrue(wait_until(self.app, lambda: win.engine.find("enforce_hardware_links")))
-        self.assertTrue(all(c[3] != MAIN_THREAD for c in win.engine.calls))
+        for plugged in (True, False, True):
+            win.jack_monitor.jack_state_changed.emit(plugged)
+            self.settle(50)
+        self.assertTrue(wait_until(self.app, lambda: len(win.engine.find("follow_jack")) == 3))
+        self.assertEqual([c[1][0] for c in win.engine.find("follow_jack")], [True, False, True])
+        self.assertEqual(self.dialogs(), [])
 
 
 class UnplugAndTrayTests(GuiBase):
-    def test_unplug_moves_unpinned_streams_to_speakers_and_respects_pins(self):
+    def test_unplug_follows_the_jack(self):
         win = self.window()
         win.engine.clear()
         win.jack_monitor.jack_state_changed.emit(False)
-        self.assertTrue(wait_until(self.app, lambda: win.engine.find("force_all_streams")))
-        call = win.engine.find("force_all_streams")[0]
-        self.assertEqual((call[1], call[2]), (("Speakers",), {"respect_pins": True}))
+        self.assertTrue(wait_until(self.app, lambda: win.engine.find("follow_jack")))
+        call = win.engine.find("follow_jack")[0]
+        self.assertEqual(call[1], (False,))
         self.assertNotEqual(call[3], MAIN_THREAD)
         self.assertEqual(win.tray_jack_action.text(), "Jack Unplugged")
         self.assertTrue(wait_until(self.app, lambda: self.notifications))
         self.assertIn("3 stream(s)", self.notifications[-1][1])
         self.assertNotEqual(self.notifications[-1][2], MAIN_THREAD)
 
-    def test_tray_force_overrides_pins(self):
+    def test_tray_force_moves_everything(self):
         win = self.window()
         win.engine.clear()
         win.force_all_streams("Headphones")
         self.assertTrue(wait_until(self.app, lambda: win.engine.find("force_all_streams")))
-        call = win.engine.find("force_all_streams")[0]
-        self.assertEqual((call[1], call[2]), (("Headphones",), {"respect_pins": False}))
+        self.assertEqual(win.engine.find("force_all_streams")[0][1], ("Headphones",))
 
     def test_hardware_resume_restores_alsa_state_off_thread(self):
         win = self.window()
@@ -517,14 +430,95 @@ class UnplugAndTrayTests(GuiBase):
         self.assertTrue(wait_until(self.app, lambda: win.status.currentMessage() == "Audio pipeline reloaded"))
 
 
+class MissingSinkTests(GuiBase):
+    def _lose_headphones(self, win):
+        win.engine.missing_sinks = {"Headphones"}
+        win.engine.sinks_ok = False
+        win.engine.recovery_exhausted = True  # no retry timer: the test drives each refresh
+        win.request_refresh()
+        self.assertTrue(wait_until(self.app, lambda: not win.master_hp.isEnabled()))
+
+    def test_controls_of_a_missing_output_are_disabled_with_an_explanation(self):
+        # The button used to look clickable while the stream silently stayed where it was
+        win = self.window()
+        self._lose_headphones(win)
+        row = win.stream_rows["2"]
+        self.assertFalse(row.btn_hp.isEnabled())
+        self.assertIn("not available", row.btn_hp.toolTip())
+        self.assertTrue(row.btn_spk.isEnabled())
+        self.assertTrue(row.btn_both.isEnabled())
+        self.assertTrue(win.master_spk.isEnabled())
+        self.assertFalse(win.tray_force_actions["Headphones"].isEnabled())
+        self.assertTrue(win.tray_force_actions["Speakers"].isEnabled())
+
+        win.engine.clear()
+        row.btn_hp.click()
+        self.settle(100)
+        self.assertEqual(win.engine.find("route_stream"), [])
+
+    def test_controls_come_back_with_the_output(self):
+        win = self.window()
+        self._lose_headphones(win)
+        win.engine.missing_sinks = set()
+        win.engine.sinks_ok = True
+        win.request_refresh()
+        self.assertTrue(wait_until(self.app, lambda: win.master_hp.isEnabled()))
+        row = win.stream_rows["2"]
+        self.assertTrue(row.btn_hp.isEnabled())
+        self.assertEqual(row.btn_hp.toolTip(), "")
+        self.assertTrue(win.tray_force_actions["Headphones"].isEnabled())
+
+    def test_a_new_stream_also_gets_the_missing_output_disabled(self):
+        win = self.window()
+        self._lose_headphones(win)
+        win.engine.streams = win.engine.streams + [stream("9", "Mpv", "mpv", "Speakers")]
+        win.request_refresh()
+        self.assertTrue(wait_until(self.app, lambda: "9" in win.stream_rows))
+        self.assertFalse(win.stream_rows["9"].btn_hp.isEnabled())
+
+
+
 class RefreshTests(GuiBase):
+    def test_missing_sinks_are_rechecked_off_the_gui_thread_until_they_return(self):
+        win = self.window()
+        eng = win.engine
+        self.settle(150)
+        win._recovery_timer.setInterval(20)
+        eng.sinks_ok = False
+        eng.clear()
+        win.request_refresh()
+        self.assertTrue(wait_until(self.app, lambda: len(eng.find("recover_missing_sinks")) >= 3))
+        self.assertTrue(all(c[3] != MAIN_THREAD for c in eng.find("recover_missing_sinks")))
+        self.assertIn("Virtual sinks unavailable", win.statusBar().currentMessage())
+
+        eng.sinks_ok = True
+        self.assertTrue(wait_until(self.app, lambda: win._sinks_ok))
+        self.settle(100)
+        eng.clear()
+        self.settle(100)
+        self.assertEqual(eng.find("recover_missing_sinks"), [], "no more retries once the sinks are back")
+
+    def test_sink_rechecks_stop_when_recovery_gives_up(self):
+        win = self.window()
+        eng = win.engine
+        self.settle(150)
+        win._recovery_timer.setInterval(20)
+        eng.sinks_ok = False
+        eng.recovery_exhausted = True
+        win.request_refresh()
+        self.assertTrue(wait_until(self.app, lambda: not win._sinks_ok))
+        self.settle(100)
+        eng.clear()
+        self.settle(100)
+        self.assertEqual(eng.find("recover_missing_sinks"), [])
+
     def test_event_flood_produces_a_bounded_number_of_snapshots(self):
         win = self.window()
         self.settle(300)
         win.engine.snapshots = 0
         for _ in range(40):
             win.pulse_monitor.changed.emit()
-            QTest.qWait(3)
+            self.settle(3)
         self.settle(500)
         self.assertGreaterEqual(win.engine.snapshots, 1)
         self.assertLessEqual(win.engine.snapshots, 8)
@@ -602,15 +596,3 @@ class LifecycleTests(GuiBase):
         self.assertEqual(done, [])
         self.assertFalse(win._refresh_timer.isActive())
 
-    def test_shutdown_closes_an_open_plug_dialog(self):
-        win = self.window()
-        win.jack_monitor.jack_state_changed.emit(True)
-        self.assertTrue(wait_until(self.app, lambda: self.dialogs()))
-        win.shutdown()
-        self.assertTrue(wait_until(self.app, lambda: not self.dialogs()))
-
-
-if __name__ == "__main__":
-    import unittest
-
-    unittest.main(verbosity=2)
