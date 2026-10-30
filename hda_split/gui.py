@@ -773,9 +773,12 @@ class AppWindow(QMainWindow):
 
         self.master_hp = MasterSinkControl("Headphones", "Headphones", self)
         self.master_spk = MasterSinkControl("Speakers", "Speakers", self)
+        self.master_hw = MasterSinkControl(self.engine.target_node, "Hardware", self)
+        self.master_hw.setToolTip("Level of the pro-audio output feeding both Headphones and Speakers")
 
         master_layout.addWidget(self.master_hp)
         master_layout.addWidget(self.master_spk)
+        master_layout.addWidget(self.master_hw)
         layout.addWidget(master_frame)
 
         # Search Bar
@@ -1063,6 +1066,7 @@ class AppWindow(QMainWindow):
         sink_info = snap["sinks"]
         self.master_hp.update_state(sink_info.get("Headphones"))
         self.master_spk.update_state(sink_info.get("Speakers"))
+        self.master_hw.update_state(sink_info.get(self.engine.target_node))
 
         streams = snap["streams"]
         active_ids = {s["id"] for s in streams}

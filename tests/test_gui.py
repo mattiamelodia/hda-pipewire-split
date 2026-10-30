@@ -35,6 +35,7 @@ class FakeEngine:
         self.calls = []
         self.lock = threading.Lock()
         self.pinned_apps = {}
+        self.target_node = "alsa_output.fake.pro-output-0"
         self.sinks_ok = True
         self.force_ret = 3
         self.snapshots = 0
@@ -78,7 +79,11 @@ class FakeEngine:
 
     def get_sink_info(self):
         self._rec("get_sink_info")
-        return {"Headphones": {"volume": 130, "muted": False}, "Speakers": {"volume": 40, "muted": True}}
+        return {
+            "Headphones": {"volume": 130, "muted": False},
+            "Speakers": {"volume": 40, "muted": True},
+            self.target_node: {"volume": 55, "muted": False},
+        }
 
     def get_external_sinks(self):
         self._rec("get_external_sinks")
@@ -250,6 +255,17 @@ class SliderTests(GuiBase):
         self.assertEqual(win.master_hp.slider.value(), 100)
         self.assertEqual(win.master_hp.val_lbl.text(), "130%")
         self.assertEqual(win.master_spk.slider.value(), 40)
+
+    def test_hardware_output_level_is_visible_and_never_raised_automatically(self):
+        # WirePlumber can leave the pro-audio node at 40%: every other slider then reads 100% but sounds quiet
+        win = self.window()
+        self.assertTrue(wait_until(self.app, lambda: win.master_hw.slider.value() == 55))
+        self.assertEqual(win.master_hw.val_lbl.text(), "55%")
+        self.assertEqual(win.engine.find("set_sink_volume"), [])
+
+        win.master_hw.slider.setValue(60)
+        self.assertTrue(wait_until(self.app, lambda: win.engine.find("set_sink_volume")))
+        self.assertEqual(win.engine.find("set_sink_volume")[-1][1], (win.engine.target_node, 60))
 
     def test_slider_cannot_be_dragged_past_100(self):
         win = self.window()

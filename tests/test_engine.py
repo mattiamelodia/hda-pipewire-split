@@ -222,6 +222,35 @@ class EnsureSinksTests(HermeticTestCase):
         self.assertFalse(engine.ensure_sinks_exist())
         self.assertLess(sum(self.clock.sleeps), 6.0, "polling must be bounded (about 5 s)")
 
+    def test_both_sink_is_kept_at_unity_so_it_matches_a_single_output(self):
+        # WirePlumber can start the sink at 40%: Both then sounds ~24 dB quieter than Headphones or Speakers
+        engine = self.make_engine()
+        self.sp.stub(["pactl", "info"], stdout="Server String: x")
+        self.sp.stub(["pactl", "list", "sinks", "short"], stdout=sinks_short(["Headphones", "Speakers", "Both"]))
+        self.sp.allow_audio_mutations()
+        self.sp.reset()
+        self.assertTrue(engine.ensure_sinks_exist())
+        volumes = [c.argv if hasattr(c, "argv") else c for c in self.sp.find("pactl", "set-sink-volume")]
+        self.assertEqual(volumes, [["pactl", "set-sink-volume", "Both", "100%"]])
+
+    def test_both_level_is_not_touched_when_the_sink_is_missing(self):
+        engine = self.make_engine()
+        self.sp.stub(["pactl", "info"], stdout="Server String: x")
+        self.sp.stub(["pactl", "list", "sinks", "short"], stdout=sinks_short(["Headphones", "Speakers"]))
+        self.sp.allow_audio_mutations()
+        self.sp.reset()
+        self.assertFalse(engine.ensure_sinks_exist())
+        self.assertEqual(self.sp.find("pactl", "set-sink-volume"), [])
+
+    def test_forcing_all_streams_to_both_also_sets_its_level(self):
+        # --force-both can run with no GUI, so ensure_sinks_exist may never have run
+        engine = self.make_engine()
+        self.sp.allow_audio_mutations()
+        self.sp.reset()
+        engine.force_all_streams("Both")
+        volumes = [c.argv if hasattr(c, "argv") else c for c in self.sp.find("pactl", "set-sink-volume")]
+        self.assertEqual(volumes, [["pactl", "set-sink-volume", "Both", "100%"]])
+
     def test_internal_sinks_present_compares_exact_names(self):
         engine = self.make_engine()
         decoys = ["Headphones2", "alsa_output.Speakers", "Both-old", "xHeadphones", "Speakers.monitor"]

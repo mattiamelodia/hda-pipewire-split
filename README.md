@@ -124,6 +124,10 @@ hda-audio-control --toggle-mute  # toggle mute on the internal outputs
 
 The app never raises ALSA hardware levels and its sliders stop at 100%. Because `pro-audio` routing bypasses the codec's normal mixer, the hardware gain may already be high: **start with the volume low when using headphones**.
 
+If everything reads 100% but sounds quiet, check the **Hardware** slider. It is the `pro-audio` output feeding both sinks, and WirePlumber may start it at 40% (about -24 dB). The app never raises it by itself. Lower the Headphones and Speakers sliders before raising it, because it can make the sound much louder.
+
+The `Both` sink has no slider: the app keeps it at 100% because it only duplicates the signal, so each output plays at the same level as when selected alone. Use the Headphones and Speakers sliders to set the level.
+
 ---
 
 ## Troubleshooting

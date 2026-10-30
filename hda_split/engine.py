@@ -173,7 +173,14 @@ class AudioEngine:
 
         # Ensure physical ports are always connected
         self.enforce_hardware_links()
-        return self._internal_sinks_present()
+        present = self._internal_sinks_present()
+        if present:
+            self._set_both_to_unity()
+        return present
+
+    def _set_both_to_unity(self) -> None:
+        """Both only duplicates the signal into Headphones and Speakers, so it must not attenuate it."""
+        self.set_sink_volume("Both", 100)
 
     # --- PipeWire Link Management ---
     def _get_configured_ports(self) -> tuple[str, str, str, str]:
@@ -266,6 +273,8 @@ class AudioEngine:
         self.set_default_target(target)
         self.ensure_hardware_ready()
         self.enforce_hardware_links()
+        if target == "Both":
+            self._set_both_to_unity()
 
         moved = 0
         for s in self.get_streams():
