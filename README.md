@@ -13,6 +13,30 @@ On modern Linux laptops (ASUS ROG/Zephyrus, Lenovo ThinkPad/Yoga, Dell XPS, HP S
 
 ---
 
+## Architecture & How It Works
+
+The application runs locally with zero background overhead, bridging ALSA hardware events directly to PipeWire's native loopback and combine modules.
+
+```text
+ [ Physical 3.5mm Jack ] 
+        │ (Hotplug / alsactl monitor)
+        ▼
+┌────────────────────────────────────────────────────────┐
+│                   AudioEngine (Python)                 │
+│  - Jack State Detection                                │
+│  - ALSA Auto-Mute Control                              │
+│  - Stream & Sink Routing                               │
+└───┬────────────────────────────────┬───────────────────┘
+    │                                │
+    ▼                                ▼
+[ Native Pipewire Sinks ]    [ Per-App Pinned Rules ]
+ ├── Headphones (AUX0/1)      └── pinned_apps.json
+ ├── Speakers   (AUX2/3)
+ └── Both       (Combine)
+ ```
+
+---
+
 ## Key Features in v1.0
 
 * **100% Native PipeWire Drop-In (Zero Subprocesses)**: Generates `~/.config/pipewire/pipewire.conf.d/99-hda-split.conf` using `libpipewire-module-loopback` and `libpipewire-module-combine-stream`. Virtual `Headphones`, `Speakers`, and an isolated `Both` sink are loaded natively by the PipeWire daemon at boot without external background processes.
