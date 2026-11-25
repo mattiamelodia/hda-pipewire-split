@@ -483,6 +483,34 @@ class EnsureSinksTests(HermeticTestCase):
         self.assertTrue(engine.ensure_sinks_exist())
         self.assertEqual(self.sp.find("systemctl"), [])
 
+    def test_missing_internal_mic_triggers_recovery_when_sources_are_listed(self):
+        engine = self._recovery_engine(["Headphones", "Speakers", "Both", TARGET])
+        self.sp.stub(["pactl", "list", "sources", "short"], stdout=sinks_short(["Headphones.monitor", "Speakers.monitor"]))
+        with mock.patch.object(eng_mod.time, "monotonic", return_value=1000.0):
+            self.assertFalse(engine.recover_missing_sinks())
+        with mock.patch.object(eng_mod.time, "monotonic", return_value=1004.0):
+            engine.recover_missing_sinks()
+        self.assertEqual(len(self.sp.find("systemctl", "--user", "restart", "pipewire")), 1)
+
+    def test_ensure_sinks_exist_fixes_raw_default_source_but_keeps_external_mic(self):
+        engine = self.make_engine()
+        self.sp.allow_audio_mutations()
+        self.sp.stub(["pactl", "info"], stdout="Server String: x")
+        self.sp.stub(["pactl", "list", "sinks", "short"], stdout=sinks_short(["Headphones", "Speakers", "Both"]))
+        self.sp.stub(
+            ["pactl", "list", "sources", "short"],
+            stdout=sinks_short(["InternalMic", engine.target_input, "alsa_input.usb-Mic"]),
+        )
+        self.sp.stub(["pactl", "get-default-source"], stdout=engine.target_input)
+        self.sp.reset()
+        self.assertTrue(engine.ensure_sinks_exist())
+        self.assertEqual(self.sp.find("pactl", "set-default-source"), [["pactl", "set-default-source", "InternalMic"]])
+
+        self.sp.stub(["pactl", "get-default-source"], stdout="alsa_input.usb-Mic")
+        self.sp.reset()
+        self.assertTrue(engine.ensure_sinks_exist())
+        self.assertEqual(self.sp.find("pactl", "set-default-source"), [])
+
 
 class EnforceHardwareLinksTests(HermeticTestCase):
     def setUp(self):
@@ -566,6 +594,23 @@ class EnforceHardwareLinksTests(HermeticTestCase):
 
     def test_enforce_hardware_links_does_nothing_without_pipewire_ports(self):
         self.assertEqual(self.enforce([], []), [])
+
+    def test_enforce_hardware_links_repairs_internal_mic_and_drops_stray(self):
+        mic_in = "alsa_input.pci-0000_65_00.6.pro-input-0"
+        self.sp.stub(["pw-link", "-o"], stdout=f"{mic_in}:capture_AUX0\n{mic_in}:capture_AUX1\nHeadphones.monitor:capture_FL")
+        self.sp.stub(["pw-link", "-i"], stdout="capture.InternalMic:input_AUX0\ncapture.InternalMic:input_AUX1")
+        self.sp.stub(["pw-link", "-l"], stdout=(
+            "Headphones.monitor:capture_FL\n  |-> capture.InternalMic:input_AUX0\n"
+            f"{mic_in}:capture_AUX1\n  |-> capture.InternalMic:input_AUX1\n"
+        ))
+        engine = self.make_engine()
+        self.sp.reset()
+        engine.enforce_hardware_links()
+        ran = [a for a in self.sp.argvs() if a[0] == "pw-link" and a[1] not in ("-o", "-l", "-i")]
+        self.assertEqual(ran, [
+            ["pw-link", "-d", "Headphones.monitor:capture_FL", "capture.InternalMic:input_AUX0"],
+            ["pw-link", f"{mic_in}:capture_AUX0", "capture.InternalMic:input_AUX0"],
+        ])
 
 
 class GetStreamsTests(HermeticTestCase):
@@ -865,8 +910,17 @@ class ConfigTests(HermeticTestCase):
                                                "SPK_PORT_R": "playback_AUX1"})
         hp = text.split('node.name = "playback.Headphones"')[1].split("}")[0]
         spk = text.split('node.name = "playback.Speakers"')[1].split("}")[0]
+        mic_block = text.split('node.description = "Headphones (Jack)"')[0]
+        mic_cap = mic_block.split("capture.props = {")[1].split("}")[0]
+        mic_src = mic_block.split("playback.props = {")[1].split("}")[0]
         self.assertIn("audio.position = [ AUX2 AUX3 ]", hp)
         self.assertIn("audio.position = [ AUX0 AUX1 ]", spk)
+        self.assertIn('target.object = "alsa_input.pci-0000_65_00.6.pro-input-0"', mic_cap)
+        self.assertIn("node.dont-reconnect = true", mic_cap)
+        self.assertIn("node.dont-move = true", mic_cap)
+        self.assertIn('media.class = "Audio/Source"', mic_src)
+        self.assertIn('node.name = "InternalMic"', mic_src)
+        self.assertIn("audio.position = [ FL FR ]", mic_src)
         self.assertEqual(len(re.findall(re.escape(f'target.object = "{TARGET}"'), text)), 2)
 
     def test_notification_goes_through_the_recorder_with_a_timeout(self):

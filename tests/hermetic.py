@@ -163,7 +163,7 @@ class SubprocessRecorder:
     def allow_audio_mutations(self):
         """The normal runtime mutations. load-module / unload-module are deliberately NOT included."""
         self.allow(
-            ["pactl", "set-card-profile"], ["pactl", "set-default-sink"],
+            ["pactl", "set-card-profile"], ["pactl", "set-default-sink"], ["pactl", "set-default-source"],
             ["pactl", "set-sink-volume"], ["pactl", "set-sink-mute"],
             ["pactl", "set-sink-input-volume"], ["pactl", "set-sink-input-mute"],
             ["pactl", "move-sink-input"],

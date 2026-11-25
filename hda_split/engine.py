@@ -9,6 +9,7 @@ from .config import (
     PW_DROPIN_FILE,
     clean_val,
     command_env,
+    input_node_for,
     load_config,
     render_pipewire_dropin,
     resolve_card_index,
@@ -33,8 +34,10 @@ class AudioEngine:
     """Manages ALSA hardware states, PipeWire loopback links, sinks, and stream routing."""
 
     INTERNAL_SINKS = ("Headphones", "Speakers", "Both")
+    INTERNAL_SOURCE = "InternalMic"
     # Playback-side loopback nodes written by the drop-in, per sink name (and their sink node name).
     LOOPBACK_NODES = {"Headphones": "playback.Headphones", "Speakers": "playback.Speakers"}
+    MIC_LOOPBACK_NODE = "capture.InternalMic"
     # node.name / node.group prefixes of our own loopback and combine-stream plumbing.
     INTERNAL_NODE_PREFIXES = ("playback.headphones", "playback.speakers", "output.", "loopback-")
     INTERNAL_GROUP_PREFIXES = ("pw-loopback-", "loopback-", "combine-sink-")
@@ -50,6 +53,7 @@ class AudioEngine:
         self.card_id: str = "0"
         self.card_name: str = ""
         self.target_node: str = ""
+        self.target_input: str = ""
         self.jack_numid: Optional[str] = None
         self._last_restart: float = 0.0
         self._sinks_missing_since: Optional[float] = None
@@ -92,6 +96,7 @@ class AudioEngine:
         self.card_id = resolve_card_index(self.cfg)
         self.card_name = self.cfg.get("CARD_NAME", "")
         self.target_node = self.cfg.get("NODE_TARGET", "")
+        self.target_input = input_node_for(self.target_node) if self.target_node else ""
         self.jack_numid = self._find_jack_numid()
 
         if not PW_DROPIN_FILE.exists():
@@ -113,6 +118,7 @@ class AudioEngine:
 
     def ensure_hardware_ready(self) -> None:
         """Selects the pro-audio profile, disables Auto-Mute, unmutes the amps and rescues levels stuck at 0%."""
+        self.card_id = resolve_card_index(self.cfg)
         if self.card_name:
             self._run_silent(["pactl", "set-card-profile", self.card_name, "pro-audio"])
 
@@ -137,9 +143,35 @@ class AudioEngine:
                 names.append(parts[1])
         return names
 
+    def _source_names(self) -> List[str]:
+        """Exact source names from column 2 of `pactl list sources short`."""
+        names: List[str] = []
+        for line in run_cmd(["pactl", "list", "sources", "short"]).splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                names.append(parts[1])
+        return names
+
     def _internal_sinks_present(self) -> bool:
         names = set(self._sink_names())
         return all(s in names for s in self.INTERNAL_SINKS)
+
+    def _internal_mic_present(self) -> bool:
+        sources = set(self._source_names())
+        if not sources:
+            return True  # tests or environments that do not populate sources
+        if self.INTERNAL_SOURCE not in sources:
+            return False
+        return not self.target_input or self.target_input in sources
+
+    def _ensure_default_source(self) -> None:
+        """Switches default source from raw pro-input-0 or monitor to InternalMic, leaving external mics untouched."""
+        sources = set(self._source_names())
+        if self.INTERNAL_SOURCE not in sources:
+            return
+        current = run_cmd(["pactl", "get-default-source"])
+        if current and (current == self.target_input or current.endswith(".monitor")):
+            self._run_silent(["pactl", "set-default-source", self.INTERNAL_SOURCE])
 
     def _card_is_listed(self) -> bool:
         cards = [line.split()[1] for line in run_cmd(["pactl", "list", "cards", "short"]).splitlines() if len(line.split()) >= 2]
@@ -190,6 +222,7 @@ class AudioEngine:
         present = self._internal_sinks_present()
         if present:
             self._set_both_to_unity()
+            self._ensure_default_source()
         return present
 
     @property
@@ -202,7 +235,7 @@ class AudioEngine:
         Bounded by a grace period, the restart cooldown and an attempt limit. Returns True if the path is complete.
         """
         names = set(self._sink_names())
-        if all(s in names for s in self.INTERNAL_SINKS) and self.target_node in names:
+        if all(s in names for s in self.INTERNAL_SINKS) and self.target_node in names and self._internal_mic_present():
             self._sinks_missing_since = None
             self._recovery_attempts = 0
             return True
@@ -273,10 +306,65 @@ class AudioEngine:
                 names[sink].append(f"output.{group}")
         return names
 
+    def _mic_capture_node_names(self) -> List[str]:
+        """Candidate node names for the InternalMic capture-side loopback stream."""
+        names = [self.MIC_LOOPBACK_NODE]
+        out = run_cmd(["pactl", "list", "sources"])
+        in_mic = False
+        for raw in out.splitlines():
+            line = raw.strip()
+            if line.startswith("Source #"):
+                in_mic = False
+            elif line == f"Name: {self.INTERNAL_SOURCE}":
+                in_mic = True
+            elif in_mic and line.startswith("node.group = "):
+                group = clean_val(line.split(" = ", 1)[1])
+                if group:
+                    names.append(f"input.{group}")
+                break
+        return names
+
+    def _enforce_mic_links(self, out_ports: List[str], links: Dict[str, List[str]]) -> None:
+        """Ensures capture.InternalMic is linked only to pro-input-0 capture_AUX0/AUX1."""
+        if not self.target_input:
+            return
+        src_l = f"{self.target_input}:capture_AUX0"
+        src_r = f"{self.target_input}:capture_AUX1"
+        if src_l not in out_ports or src_r not in out_ports:
+            return
+        in_ports = [p.strip() for p in run_cmd(["pw-link", "-i"]).splitlines()]
+        if not in_ports:
+            return
+
+        incoming: Dict[str, List[str]] = {}
+        for out_p, dests in links.items():
+            for in_p in dests:
+                incoming.setdefault(in_p, []).append(out_p)
+
+        sides = (
+            ("input_AUX0", "input_FL", src_l),
+            ("input_AUX1", "input_FR", src_r),
+        )
+        for node in self._mic_capture_node_names():
+            for port in in_ports:
+                node_part, _, port_part = port.partition(":")
+                if node_part != node:
+                    continue
+                for aux_name, std_name, src in sides:
+                    if port_part not in (aux_name, std_name):
+                        continue
+                    current = incoming.get(port, [])
+                    for stray in current:
+                        if stray != src:
+                            self._run_silent(["pw-link", "-d", stray, port])
+                    if src not in current:
+                        self._run_silent(["pw-link", src, port])
+                    break
+
     def enforce_hardware_links(self) -> None:
         """
-        Makes the loopback nodes of the Headphones and Speakers sinks (and only those) feed the
-        configured physical AUX ports: removes stray links (e.g. Speakers -> Headphones) and adds missing ones.
+        Makes the loopback nodes of the Headphones, Speakers and InternalMic devices (and only those)
+        connect to the configured physical AUX ports: removes stray links and adds missing ones.
         """
         out_ports = [p.strip() for p in run_cmd(["pw-link", "-o"]).splitlines()]
         if not out_ports:
@@ -311,6 +399,8 @@ class AudioEngine:
                         if dest not in current:
                             self._run_silent(["pw-link", port, dest])
                         break
+
+        self._enforce_mic_links(out_ports, links)
 
     # --- Routing & Sink Controls ---
     def route_stream(self, stream_id: str, target: str) -> bool:
